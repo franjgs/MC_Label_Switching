@@ -189,8 +189,8 @@ def compute_weights(targets_train, RI_C=1, Q_P=1, mode='normal'):
         targets_train (np.ndarray): Array of training targets (-1 or 1).
         RI_C (float): Desired cost Rebalance intensity. Defaults to 1 (no explicit rebalancing).
             - If float (>= 1):
-                - If mode is "normal": Weight of the positive class (assumed minority if Q_P > 1) is RI_C (capped at Q_P).
-                - If mode is "reverse": Weight of the negative class is 1/RI_C (capped at 1/Q_P).
+                - If mode is "proportional_minority": Weight of the positive class (assumed minority if Q_P > 1) is RI_C (capped at Q_P).
+                - If mode is "proportional_majority_reverse": Weight of the negative class is 1/RI_C (capped at 1/Q_P).
         Q_P (float): Imbalance ratio (number of majority class samples / number of minority class samples). Defaults to 1.
         mode (str): Mode of rebalancing. Defaults to 'proportional_minority'.
             - 'normal': Weights the minority class (positive if Q_P > 1) by RI_C.

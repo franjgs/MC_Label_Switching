@@ -92,32 +92,53 @@ datasets = load_datasets(data_path, N_max, dataset_special_cases)
 for dataset_name, (X, y, C0) in datasets.items():
     n_samples, n_attributes = X.shape
     nclass = np.unique(y).shape[0]
+    if nclass > 2:
+        if maj_min:
+            sorted_classes = pd.Series(y).value_counts().index.to_list()
+            class_dict = {sorted_classes[k]: nclass - k for k in range(nclass)}
+        elif min_maj:
+            sorted_classes = pd.Series(y).value_counts().index.to_list()
+            class_dict = {sorted_classes[k]: k + 1 for k in range(nclass)}
+        else:
+            class_dict = {k + 1: k + 1 for k in range(nclass)}
+        
+        y = np.vectorize(class_dict.get)(y)
 
-    if maj_min:
-        sorted_classes = pd.Series(y).value_counts().index.to_list()
-        class_dict = {sorted_classes[k]: nclass - k for k in range(nclass)}
-    elif min_maj:
-        sorted_classes = pd.Series(y).value_counts().index.to_list()
-        class_dict = {sorted_classes[k]: k + 1 for k in range(nclass)}
-    else:
-        class_dict = {k + 1: k + 1 for k in range(nclass)}
-    y = np.vectorize(class_dict.get)(y)
+        class_labels = np.array(sorted(class_dict.keys()))
+    
+        M_ecoc = ECOC(encoding=ECOC_enc, labels=class_labels)
+        M = (M_ecoc._code_matrix > 0).astype(int)
+    
+        if True:
+            M[M == 1] = -C0
+            M[M == 0] = C0
+    
+        M_ecoc._code_matrix = M
+    
+        num_dichotomies = M_ecoc._code_matrix.shape[1]
+        IB_degree = imbalance_degree(y, "EU")
+    elif nclass == 2:
+        # Ensure -1 is the label for the majority class
+        if np.sum(y == -1) < np.sum(y == 1):
+            y = -y  # Swap -1 and +1
 
-    class_labels = np.array(sorted(class_dict.keys()))
-
-    M_ecoc = ECOC(encoding=ECOC_enc, labels=class_labels)
-    M = (M_ecoc._code_matrix > 0).astype(int)
-
-    if True:
+        class_labels = np.unique(y)
+        M_ecoc = ECOC(encoding=ECOC_enc, labels=class_labels)
+        M = (M_ecoc._code_matrix > 0).astype(int)
         M[M == 1] = -C0
         M[M == 0] = C0
-
-    M_ecoc._code_matrix = M
-
-    num_dichotomies = M_ecoc._code_matrix.shape[1]
+        M_ecoc._code_matrix = M
+        num_dichotomies = M_ecoc._code_matrix.shape[1]
+        IB_degree = compute_imbalance_ratio(y)
+        # Convert binary labels -1 and +1 to 1 and 2
+        label_map_binary = {-1: 1, 1: 2}
+        y = np.array([label_map_binary[label] for label in y])
+    else:
+        raise ValueError(f"Number of classes ({nclass}) must be greater than or equal to 2.")
+        
     logger.info('')
     logger.info('-----------------------------------------------------')
-    logger.info(f'Dataset: {dataset_name}. Imbalance Degree = {imbalance_degree(y, "EU"):.2f}')
+    logger.info(f'Dataset: {dataset_name}. Imbalance Degree = {IB_degree:.2f}')
     logger.info(f'ECOC encoding: {M_ecoc.encoding}. Flag swap: {flg_swp}')
     logger.info(f'Number of classes: {nclass}. Number of Dichotomies: {num_dichotomies}')
     logger.info('f_sel: '+f_sel.__name__)
@@ -250,7 +271,7 @@ for dataset_name, (X, y, C0) in datasets.items():
                         model = model_class(**cv_config)
                                 
                         # Train the model
-                        if model_name == "MLPClassifier" or model_name == "kNN":
+                        if model_name in ["MLPClassifier", "kNN", "MultiRandBal"]:
                             model.fit(x_train, ye_train)
                         else:
                             model.fit(x_train, ye_train, sample_weight=cw_train)

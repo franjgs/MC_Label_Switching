@@ -6,6 +6,7 @@ import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score, balanced_accuracy_score
+from sklearn.metrics import f1_score
 from sklearn.metrics import confusion_matrix, cohen_kappa_score
 
 # Imbalanced Learning Metrics
@@ -16,6 +17,8 @@ from libraries.functions import load_config, setup_logger, get_class_from_string
 from libraries.data_loading import load_datasets
 from libraries.ecoc import ECOC
 from libraries.imbalance_degree import imbalance_degree
+from libraries.functions import compute_imbalance_ratio
+
 from libraries.functions import apply_ecoc_binarization
 
 import warnings
@@ -53,32 +56,52 @@ for dataset_name, (X, y, C0) in datasets.items():
     
     nclass = np.unique(y).shape[0]
 
-    if maj_min:
-        sorted_classes = pd.Series(y).value_counts().index.to_list()
-        class_dict = {sorted_classes[k]: nclass - k for k in range(nclass)}
-    elif min_maj:
-        sorted_classes = pd.Series(y).value_counts().index.to_list()
-        class_dict = {sorted_classes[k]: k + 1 for k in range(nclass)}
-    else:
-        class_dict = {k + 1: k + 1 for k in range(nclass)}
-    y = np.vectorize(class_dict.get)(y)
+    if nclass > 2:
+        if maj_min:
+            sorted_classes = pd.Series(y).value_counts().index.to_list()
+            class_dict = {sorted_classes[k]: nclass - k for k in range(nclass)}
+        elif min_maj:
+            sorted_classes = pd.Series(y).value_counts().index.to_list()
+            class_dict = {sorted_classes[k]: k + 1 for k in range(nclass)}
+        else:
+            class_dict = {k + 1: k + 1 for k in range(nclass)}
+        y = np.vectorize(class_dict.get)(y)
+    
+        class_labels = np.array(sorted(class_dict.keys()))
+    
+        M_ecoc = ECOC(encoding=ECOC_enc, labels=class_labels)
+        M = (M_ecoc._code_matrix > 0).astype(int)
+    
+        if True:
+            M[M == 1] = -C0
+            M[M == 0] = C0
+    
+        M_ecoc._code_matrix = M
+        IB_degree = imbalance_degree(y, "EU")
+        
+    elif nclass == 2:
+        # Ensure -1 is the label for the majority class
+        if np.sum(y == -1) < np.sum(y == 1):
+            y = -y  # Swap -1 and +1
 
-    class_labels = np.array(sorted(class_dict.keys()))
-
-    M_ecoc = ECOC(encoding=ECOC_enc, labels=class_labels)
-    M = (M_ecoc._code_matrix > 0).astype(int)
-
-    if True:
+        class_labels = np.unique(y)
+        M_ecoc = ECOC(encoding=ECOC_enc, labels=class_labels)
+        M = (M_ecoc._code_matrix > 0).astype(int)
         M[M == 1] = -C0
         M[M == 0] = C0
-
-    M_ecoc._code_matrix = M
+        M_ecoc._code_matrix = M
+        num_dichotomies = M_ecoc._code_matrix.shape[1]
+        IB_degree = compute_imbalance_ratio(y)
+        # Convert binary labels -1 and +1 to 1 and 2
+        label_map_binary = {-1: 1, 1: 2}
+        y_converted = np.array([label_map_binary[label] for label in y])
+        y = y_converted
 
     num_dichotomies = M_ecoc._code_matrix.shape[1]
 
     logger.info('Multiclass Results')
     logger.info('---------------------------------------------')
-    logger.info(f'Dataset: {dataset_name}. Imbalance Degree = {imbalance_degree(y, "EU"):.2f}')
+    logger.info(f'Dataset: {dataset_name}. Imbalance Degree = {IB_degree:.2f}')
     logger.info(f'ECOC encoding: {M_ecoc.encoding}. Flag swap: {flg_swp}')
     logger.info(f'Classes: {nclass}. Dichotomies: {num_dichotomies}')
     logger.info('---------------------------------------------')
@@ -107,13 +130,12 @@ for dataset_name, (X, y, C0) in datasets.items():
             RI_P_optimization = model_item['LSE_optimization']['RI_P']
             logger.info(f'    Switching: {int(SW_optimization)}, QC: {int(QC_optimization)}, Cost: {int(RI_C_optimization)}, Population: {int(RI_P_optimization)}')
 
-            filename_i = f"{dataset_name}_{ECOC_enc}_{model_name}_SW_{int(SW_optimization)}_QC_{int(QC_optimization)}_RIC_{int(RI_C_optimization)}_RIP_{int(RI_P_optimization)}_train.pkl"
-            filename_o = f"{dataset_name}_{ECOC_enc}_{model_name}_SW_{int(SW_optimization)}_QC_{int(QC_optimization)}_RIC_{int(RI_C_optimization)}_RIP_{int(RI_P_optimization)}_test.pkl"
-        else:
-            filename_i = f"{dataset_name}_{ECOC_enc}_{model_name}_train.pkl"
-            filename_o = f"{dataset_name}_{ECOC_enc}_{model_name}_test.pkl"
     
-        file_path = os.path.join(output_path, filename_i)
+            filename_o = f"{dataset_name}_{ECOC_enc}_{model_name}_SW_{int(SW_optimization)}_QC_{int(QC_optimization)}_RIC_{int(RI_C_optimization)}_RIP_{int(RI_P_optimization)}_train.pkl"
+        else:
+            filename_o = f"{dataset_name}_{ECOC_enc}_{model_name}_train.pkl"
+    
+        file_path = os.path.join(output_path, filename_o)
     
         try:
             with open(file_path, 'rb') as f:
@@ -131,11 +153,11 @@ for dataset_name, (X, y, C0) in datasets.items():
         f1_simulations = []
         mcc_simulations = []
     
-        n_simus_new = max(n_simus, 50) 
-        for k_simu in range(n_simus_new):  
-            logger.info(f'    Simulation: {k_simu} out of {n_simus_new}')
+        n_simus = max(n_simus, 20) # Assuming 100 test simulations
+        for k_simu in range(n_simus):  
+            logger.info(f'    Simulation: {k_simu} out of {n_simus}')
             
-            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.01 * Test_size, random_state=42 + k_simu%n_simus)
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.01 * Test_size, random_state=42 + k_simu)
             M_tst = X_test.shape[0]
     
             scaler = StandardScaler()
@@ -167,7 +189,7 @@ for dataset_name, (X, y, C0) in datasets.items():
                     cv_config = best_model_config[j_dic][0] # Get the best config only
                     model = model_class(**cv_config)
                         # Train the model
-                    if model_name == "MLPClassifier" or model_name == "kNN":
+                    if model_name in ["MLPClassifier","kNN", "MultiRandBal"]:
                         model.fit(x_train, ye_train)
                     else:
                         model.fit(x_train, ye_train, sample_weight=cw_train)
@@ -176,7 +198,11 @@ for dataset_name, (X, y, C0) in datasets.items():
                         ye_pred *= -1
                     Ye_pred[:, j_dic] = ye_pred
     
-            y_pred_MC_ab = np.array([M_ecoc._get_closest_class(Ye_pred[row, :]) for row in range(M_tst)])
+            if nclass > 2:
+                y_pred_MC_ab = np.array([M_ecoc._get_closest_class(Ye_pred[row, :]) for row in range(M_tst)])
+            elif nclass == 2:
+                y_pred_MC_ab = (3+np.array([M_ecoc._get_closest_class(Ye_pred[row, :]) for row in range(M_tst)]))/2
+
     
             mat_confusion_ab = confusion_matrix(y_test, y_pred_MC_ab, labels=class_labels)
             cohen_kappa_ab = cohen_kappa_score(y_test, y_pred_MC_ab)
@@ -184,13 +210,17 @@ for dataset_name, (X, y, C0) in datasets.items():
             bal_acc_ab = balanced_accuracy_score(y_test, y_pred_MC_ab)
             geom_mean_ab = geometric_mean_score(y_test, y_pred_MC_ab, average='weighted')
             sensitivity_ab = sensitivity_score(y_test, y_pred_MC_ab, average='weighted')
-            
+            if nclass > 2:
+                f1_score_ab = f1_score(y_test, y_pred_MC_ab, average='weighted')
+            elif nclass == 2:
+                f1_score_ab = f1_score(y_test-1, y_pred_MC_ab-1)
             # Store metrics for the current simulation
             acc_simulations.append(acc_ab)
             bal_acc_simulations.append(bal_acc_ab)
             kappa_simulations.append(cohen_kappa_ab)
             geom_mean_simulations.append(geom_mean_ab)
             sensitivity_simulations.append(sensitivity_ab)
+            f1_simulations.append(f1_score_ab)
             
         # Calculate the average and standard deviation for the model
         model_metrics = {
@@ -199,11 +229,13 @@ for dataset_name, (X, y, C0) in datasets.items():
             "avg_kappa": np.mean(kappa_simulations),
             "avg_geom_mean": np.mean(geom_mean_simulations),
             "avg_sensitivity": np.mean(sensitivity_simulations),
+            "avg_f1_score": np.mean(f1_simulations),
             "std_acc": np.std(acc_simulations),
             "std_bal_acc": np.std(bal_acc_simulations),
             "std_kappa": np.std(kappa_simulations),
             "std_geom_mean": np.std(geom_mean_simulations),
             "std_sensitivity": np.std(sensitivity_simulations),
+            "std_f1_score": np.std(f1_simulations),
         }
     
         # Add mc_metrics to result_data
@@ -216,6 +248,7 @@ for dataset_name, (X, y, C0) in datasets.items():
         logger.info(f"Cohen's Kappa: {model_metrics['avg_kappa']:.5f} \u00B1 {model_metrics['std_kappa']:.5f}")
         logger.info(f"Geometric Mean Score (weighted): {model_metrics['avg_geom_mean']:.5f} \u00B1 {model_metrics['std_geom_mean']:.5f}")
         logger.info(f"Sensitivity Score (weighted): {model_metrics['avg_sensitivity']:.5f} \u00B1 {model_metrics['std_sensitivity']:.5f}")
+        logger.info(f"F1 Score (weighted): {model_metrics['avg_f1_score']:.5f} \u00B1 {model_metrics['std_f1_score']:.5f}")
 
     
         # Save the combined configuration and metrics using pickle
