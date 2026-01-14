@@ -321,7 +321,43 @@ for dataset_name, (X, y, C0) in datasets.items():
             "avg_sensitivity": np.mean(sensitivity_simulations), "std_sensitivity": np.std(sensitivity_simulations),
             "avg_f1_score": np.mean(f1_simulations), "std_f1_score": np.std(f1_simulations),
         }
-
+        # Store the class labels for proper interpretation later
+        model_metrics["class_labels"] = class_labels.tolist()
+        
+        # Existing multiclass metrics from the input PKL (old evaluation)
+        old_metrics = result_data.get('multiclass_metrics', None)
+        
+        update_metrics = False
+        
+        if old_metrics is not None and 'avg_bal_acc' in old_metrics:
+            old_bal_acc = old_metrics['avg_bal_acc']
+            old_bal_acc_std = old_metrics.get('std_bal_acc', np.nan)
+            
+            new_bal_acc = model_metrics['avg_bal_acc']
+            new_bal_acc_std = model_metrics['std_bal_acc']
+            
+            # Criterion: update if new mean is better AND not much more variable
+            if new_bal_acc > old_bal_acc:
+                if new_bal_acc_std <= 1.5 * old_bal_acc_std or np.isnan(old_bal_acc_std):
+                    update_metrics = True
+                    reason = f"Improved balanced acc: {old_bal_acc:.4f} → {new_bal_acc:.4f}"
+                else:
+                    reason = f"Not updated: better mean ({new_bal_acc:.4f} > {old_bal_acc:.4f}) but higher variance"
+            else:
+                reason = f"Not updated: worse balanced acc ({new_bal_acc:.4f} ≤ {old_bal_acc:.4f})"
+        else:
+            # No previous metrics → always update (first evaluation)
+            update_metrics = True
+            reason = "No previous metrics found → using current evaluation"
+        
+        # Update if criteria met
+        if update_metrics:
+            result_data["multiclass_metrics"] = model_metrics.copy()  # .copy() to avoid reference issues
+            logger.info(f"Multiclass metrics UPDATED: {reason}")
+        else:
+            logger.info(f"Multiclass metrics NOT updated: {reason}")
+            logger.info(f"Keeping previous balanced acc: {old_bal_acc:.4f} ± {old_bal_acc_std:.4f}")
+        
         # Always update runtime (it's new information)
         result_data["execution_time_seconds"] = np.mean(runtime_simulations)        # total time 
         # Normalize by number of dichotomies (makes it comparable across datasets)

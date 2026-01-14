@@ -108,8 +108,24 @@ def generate_model_configurations(model_list):
             if not SW_optimization:
                 model_item["dynamic_params"]["LS_alpha"] = [0]
                 model_item["dynamic_params"]["LS_beta"] = [0]
+            else:
+                model_item['params']['SW_mode'] = "normal"
+                Alpha = model_item['dynamic_params']['LS_alpha']
+                Beta = model_item['dynamic_params']['LS_alpha']
+                Alpha_intervals = None  # Initialize Alpha_intervals
+                Beta_intervals = None  # Initialize Beta_intervals
+                if isinstance(Alpha, list) and len(Alpha) > 0:
+                    if Alpha[0] == "auto":
+                        if len(Alpha) > 1 and isinstance(Alpha[1], int) and Alpha[1] > 0:
+                            model_item['params']['SW_mode'] = "auto"
+                            Alpha_intervals = Alpha[1]
+                            model_item['dynamic_params']['LS_alpha']= list(range(1, Alpha_intervals + 1))
+                        else:
+                            print("Error in ALSE configuration: When Alpha[0] is 'auto', the next element must be a positive integer.")
+                            
             if not QC_optimization:
                 model_item["dynamic_params"]["LS_Q_C"] = [1]
+                
             if not RI_C_optimization:
                 model_item["dynamic_params"]["LS_Q_RB_C"] = [1]
             else:
@@ -507,3 +523,27 @@ def generate_batches(nBatch, param, mode='random', seed=42):
     for kbatch in range(num_batches):
         yield list_samples_batch[kbatch]
 
+
+def estimate_alpha(ir: float, cap: bool = True) -> float:
+    """
+    Estimates a reasonable starting value for Alpha based on Imbalance Ratio (IR).
+    
+    The function uses a simple logarithmic relationship fitted to your data.
+    For very high IR, it caps the estimate to avoid unrealistic values.
+    
+    Args:
+        ir (float): Real Imbalance Ratio of the dichotomy (>=1.0)
+        cap (bool): Whether to cap the maximum Alpha at 0.45 (default: True)
+    
+    Returns:
+        float: Estimated Alpha value (between 0.0 and 0.45)
+    """
+    if ir <= 1.0:
+        return 0.08  # Minimum reasonable value for nearly balanced cases
+    
+    alpha_est = 0.12 * np.log10(ir) + 0.08
+    
+    if cap:
+        alpha_est = min(alpha_est, 0.45)
+    
+    return round(alpha_est, 3)

@@ -25,6 +25,8 @@ METRIC_FUNCTIONS = {
 from sklearn.model_selection import (
     KFold,
     train_test_split,
+   StratifiedKFold,
+   StratifiedShuffleSplit
 )
 from sklearn.preprocessing import (
     StandardScaler,
@@ -37,7 +39,7 @@ from libraries.data_loading import load_datasets
 from libraries.functions import load_config, setup_logger, get_class_from_string
 from libraries.functions import generate_model_configurations, apply_ecoc_binarization
 
-from libraries.functions import compute_imbalance_ratio
+from libraries.functions import compute_imbalance_ratio, estimate_alpha
 from libraries.imbalance_degree import imbalance_degree
 
 # Suppress ConvergenceWarnings
@@ -76,10 +78,39 @@ if metric_function_name not in METRIC_FUNCTIONS:
 f_sel = METRIC_FUNCTIONS[metric_function_name]
 model_selection = config["simulation"]["model_selection"]
 
-# Model Configuration
+# Model Configuration - Full list of available models
 model_list = config["models"]
-model_list = [model_list[2]]
-# del model_list[2]
+
+# COMMENTS FOR SAFE SELECTION:
+# - LogisticRegression: index 0 – Logistic regression with L2 regularization
+# - RandomForestClassifier: index 1 – Random forest with class_weight='balanced'
+# - LSEnsemble: index 2 – Asymmetric Label Switched Ensemble (ALSE) – OUR MAIN METHOD
+# - MLPClassifier: index 3 – Standard multilayer perceptron from scikit-learn
+# - LGBMClassifier: index 4 – LightGBM with is_unbalance=True
+# - kNN: index 5 – K-Nearest Neighbors
+# - C4.5: index 6 – Decision tree with entropy criterion (C4.5 approximation)
+# - SVM: index 7 – Support Vector Machine with RBF kernel
+# - MultiRandBal: index 8 – Ensemble with SMOTE oversampling + random undersampling
+
+# Examples of selection (uncomment the desired line):
+
+# 1. Run ALL models (default configuration)
+# model_list = config["models"]
+
+# 2. Run only our main method (LSEnsemble / ALSE)
+# model_list = [config["models"][2]] # Only ALSE
+
+# 3. Comparison between ALSE and classical baselines (example: RF + LightGBM + SVM + MLP)
+# model_list = [config["models"][i] for i in [1, 4, 7, 3]]
+
+# 4. Run only baselines without ALSE (for ablation or clean comparison)
+# model_list = [config["models"][i] for i in [0, 1, 3, 4, 5, 6, 7, 8]]
+# del model_list[2]  # Example of exclusion if using the full list
+
+# Apply the desired selection here (uncomment only one option)
+# model_list = config["models"]  # All models
+model_list = [config["models"][i] for i in [1, 4, 7, 3]]
+model_list = [config["models"][2]] # Only ALSE
 
 # Generate Model Configurations
 CV_config = generate_model_configurations(model_list)
@@ -143,6 +174,7 @@ for dataset_name, (X, y, C0) in datasets.items():
     logger.info(f'Number of classes: {nclass}. Number of Dichotomies: {num_dichotomies}')
     logger.info('f_sel: '+f_sel.__name__)
     
+    CV_config_full = {}
     best_model_avg = {}
     metric_conf = {}
     CM_accumulated = {}
@@ -164,6 +196,7 @@ for dataset_name, (X, y, C0) in datasets.items():
         dynamic_combinations = model_item["dynamic_params"]
         n_conf_test = len(list(product(*model_item["dynamic_params"].values())))
 
+        CV_config_full[model_name] = [[] for j_dic in range(num_dichotomies)]
         CM_accumulated[model_name] = [np.zeros((n_conf_test, 2, 2)) for j_dic in range(num_dichotomies)]  # Accumulated confusion matrix
         metric_conf[model_name] = np.zeros((n_conf_test, num_dichotomies, num_folds, n_simus))
         best_metric_avg[model_name] = np.zeros(num_dichotomies)
@@ -185,7 +218,9 @@ for dataset_name, (X, y, C0) in datasets.items():
         X_test_n = scaler.transform(X_test)
         
         # Inner 5-Fold for validation
-        inner_cv = KFold(n_splits=num_folds, shuffle=True, random_state=42+k_simu)
+        # inner_cv = KFold(n_splits=num_folds, shuffle=True, random_state=42+k_simu)
+        # inner_cv = StratifiedKFold(n_splits=num_folds, shuffle=True, random_state=42+k_simu)
+        inner_cv = StratifiedShuffleSplit(n_splits=1, test_size=0.01*Test_size, random_state=42+k_simu)
         for nFold, (train_index, val_index) in enumerate(inner_cv.split(X_train, y_train), 1):
             if verbose:
                 logger.info(f"Simulation {k_simu+1}. Inner Fold {nFold}:")
@@ -236,8 +271,16 @@ for dataset_name, (X, y, C0) in datasets.items():
                                     model_item['dynamic_params']['LS_Q_RB_S'] = np.linspace(1, QP_tr[j_dic], n_items).tolist()
                             elif model_item['params']['Q_RB_S_mode'] == "full": # Full Rebalance
                                 model_item['dynamic_params']['LS_Q_RB_S'] = [QP_tr[j_dic]]
+                        
+                        if model_item['LSE_optimization']['SW']:
+                            # Cost: auto
+                            if model_item['params']['SW_mode'] == "auto":
+                                alpha_start = estimate_alpha(QP_tr[j_dic])
+                                n_items = len(model_item['dynamic_params'].get('LS_alpha', []))
+                                if n_items > 0:
+                                    model_item['dynamic_params']['LS_alpha'] = np.round(np.linspace(max(0.0, alpha_start - 0.10),
+                                                                                                    min(0.45, alpha_start + 0.12), n_items), 3).tolist() 
                                 
-                        CV_temp = CV_config[model_name]
                         CV_config[model_name] = []  # Reset to avoid accumulating old configs
                         params = model_item['params']
                         dynamic_params = model_item['dynamic_params']
@@ -264,6 +307,8 @@ for dataset_name, (X, y, C0) in datasets.items():
                         # Generate all parameter combinations
                         for combination in product(*param_grid.values()):
                             CV_config[model_name].append(dict(zip(param_grid.keys(), combination)))
+                        
+                        CV_config_full[model_name][j_dic] = CV_config[model_name]
                 
                     k_conf = 0
                     for cv_config in CV_config[model_name]:
@@ -308,7 +353,7 @@ for dataset_name, (X, y, C0) in datasets.items():
         model_name = model_item["name"]
         for j_dic in range(num_dichotomies):
             k_conf = 0
-            for cv_config in CV_config[model_name]:
+            for cv_config in CV_config_full[model_name][j_dic]:
                 # Compute the averaged metric for this configuration after all simulations and folds
                 avg_metric_conf = np.mean(metric_conf[model_name][k_conf, j_dic, :, :])
                 # Normalize by the total number of test samples to get the mean confusion matrix
@@ -337,7 +382,7 @@ for dataset_name, (X, y, C0) in datasets.items():
             elif model_selection == "avg":
                 # Select based on average performance (best_metric_avg)
                 best_model[model_name][j_dic] = best_model_avg[model_name][j_dic] # cv_config, metric, CM
-                best_metric[model_name][j_dic] = best_metric_peak[model_name][j_dic]
+                best_metric[model_name][j_dic] = best_metric_avg[model_name][j_dic]
             if verbose:
                 logger.info(f'Model: {model_name}. Dichotomy: {j_dic+1}')
                 logger.info(f'Best configuration ({model_selection}): {best_model[model_name][j_dic][0]}')  # cv_config
@@ -346,8 +391,20 @@ for dataset_name, (X, y, C0) in datasets.items():
                 logger.info('')
     
         # Prepare data to save
+        
         result_data = {
+            "dataset": dataset_name,
+            'nclass': nclass,
+            "class_labels": class_labels.tolist(),
+            "ECOC_enc": ECOC_enc,
+            "num_dichotomies": num_dichotomies,
+            'flag_swap': flag_swap,
             "model_name": model_name,
+            'n_simus': n_simus,
+            'num_folds': num_folds,
+            "Test_size": Test_size,
+            'f_sel': metric_function_name,
+            
             "best_config": best_model[model_name],
             "binary_metrics": {
                 "best_metric_peak": best_metric_peak[model_name],

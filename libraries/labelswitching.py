@@ -365,15 +365,19 @@ def train_model(x, y, model, loss_fn, optimizer, weights, num_epochs=10, batch_s
     - debug: If True, print debug information.
     """
     
+    # Set batch_size to full dataset length if not specified (standard for L-BFGS)
     batch_size = len(x) if batch_size is None or batch_size == 'auto' else int(batch_size)
-
     trainloader = create_dataloader(x, y, weights, batch_size=batch_size, mode=mode)
 
+    # Dynamically detect the model's dtype to avoid precision mismatch (float32 vs float64)
+    model_dtype = next(model.parameters()).dtype
+    
     for epoch in range(num_epochs):
         for batch_idx, (features, labels, batch_weights) in enumerate(trainloader):
-            features = features.float()
-            labels = labels.view(-1, 1)
-            batch_weights = batch_weights.float()
+            # Sync input data types with the model's parameters
+            features = features.to(model_dtype)
+            labels = labels.to(model_dtype).view(-1, 1)
+            batch_weights = batch_weights.to(model_dtype).view(-1, 1)
             
             if lbfgs:
                 # Define closure for LBFGS optimizer
@@ -385,35 +389,48 @@ def train_model(x, y, model, loss_fn, optimizer, weights, num_epochs=10, batch_s
                     return loss
                 
                 # Perform optimization step
+                # L-BFGS step calls the closure multiple times to estimate the Hessian
                 optimizer.step(closure)
-                
-                # Optionally retrieve the loss value explicitly
-                loss = closure()
+                current_loss = closure().item()
             else:
-                # For standard optimizers
+                # Standard gradient descent step (SGD, Adam, etc.)
                 optimizer.zero_grad()
                 outputs = model(features)
                 loss = loss_fn(outputs, labels, batch_weights)
                 loss.backward()
                 optimizer.step()
+                current_loss = loss.item()
     
             # Debug logging
             if debug and batch_idx % 10 == 0:
-                print(f"Epoch {epoch + 1}, Batch {batch_idx + 1}, Loss: {loss.item():.5f}")
+                print(f"Epoch {epoch + 1}, Batch {batch_idx + 1}, Loss: {current_loss:.5f}")
 
     return model
 
+
 def weighted_mse_loss(inputs, target, weights=None):
-    if isinstance(target,np.ndarray):
-        target=torch.from_numpy(target)
-    if isinstance(inputs,np.ndarray):
-        inputs=torch.from_numpy(inputs)
-    if weights==None:
+    """
+    Compute the weighted Mean Squared Error loss.
+    
+    Args:
+        inputs (torch.Tensor): Model predictions.
+        target (torch.Tensor): Ground truth labels.
+        weights (torch.Tensor, optional): Sample weights. Defaults to 1 for all samples.
+        
+    Returns:
+        torch.Tensor: Scalar loss value (0.5 * sum of weighted squared errors).
+    """
+    if isinstance(target, np.ndarray):
+        target = torch.from_numpy(target)
+    if isinstance(inputs, np.ndarray):
+        inputs = torch.from_numpy(inputs)
+    if weights is None:
         weights = torch.ones_like(inputs)
 
     # Compute weighted MSE
     weighted_diff = weights * (inputs - target) ** 2
-    return 0.5 * torch.sum(weighted_diff) #  / torch.sum(weights)
+    # Calculate 0.5 * sum(w * (y_pred - y_true)^2)
+    return 0.5 * torch.sum(weighted_diff)
 
 # Base class to handle common initialization logic
 class BaseAsymmetricMLP(nn.Module):
@@ -421,38 +438,51 @@ class BaseAsymmetricMLP(nn.Module):
         super().__init__()
         self.alpha = alpha
         self.beta = beta
-        self.activation_fn = activation_fn  # Accept activation function as a parameter
-        self.init_weights()
+        self.activation_fn = activation_fn
 
     def init_weights(self):
+        """
+        Applies Xavier uniform initialization to weights.
+        """
         def weight_init(m):
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+                # Bias remains with PyTorch default random initialization
         self.apply(weight_init)
 
 class AsymmetricMLP(BaseAsymmetricMLP):
     def __init__(self, input_size, hidden_size, alpha, beta, dropout_prob=0.0, activation_fn=torch.tanh, output_act=1):
         super().__init__(input_size, hidden_size, alpha, beta, activation_fn)
-        self.hidden0 = nn.Linear(input_size, hidden_size)  # Input to hidden layer
-        self.dropout = nn.Dropout(dropout_prob)  # Add dropout
-        self.out = nn.Linear(hidden_size, 1)  # Hidden to output layer
+        
+        # We use Sequential to exactly match the structure and initialization order of Program 1
+        self.hidden0 = nn.Sequential(
+            nn.Linear(input_size, hidden_size)
+        )
+        
+        # We define 'out' immediately after 'hidden0' to match the PRNG sequence
+        self.out = nn.Sequential(
+            nn.Linear(hidden_size, 1)
+        )
+        
+        # Define dropout separately (it doesn't use random numbers during init, 
+        # but we place it here to not interfere with the layer registration order)
+        self.dropout = nn.Dropout(dropout_prob)
 
-        # Ensure double precision
-        self.hidden0 = self.hidden0.to(torch.float64)
-        self.out = self.out.to(torch.float64)
+        # Apply weight initialization
+        self.init_weights()
 
-        # Mode determines the output activation function
+        # Match precision
+        self.to(torch.float64)
         self.output_act = output_act
 
     def forward(self, x):
-        x = x.to(torch.float64)  # Ensure input is float64
-        o = self.activation_fn(self.hidden0(x))  # Apply activation to hidden layer
-        o = self.dropout(o)  # Apply dropout
-        z = self.out(o)  # Output layer
+        x = x.to(torch.float64)
+        
+        # Matches Program 1: tanh(hidden0(x))
+        o = self.activation_fn(self.hidden0(x))
+        o = self.dropout(o)
+        z = self.out(o)
 
-        # Apply different output activation functions based on output_mode
         if self.output_act == 1:
             return torch.where(
                 z < 0,
@@ -565,6 +595,7 @@ class LSEnsemble(nn.Module):
         if input_size is not None:
             self.initialize_experts(input_size)
 
+    """
     def initialize_experts(self, input_size):
         if self.base_learner == 'FAMLP':  # Use Full AsymmetricMLP 
             # Create experts with the actual input size
@@ -579,6 +610,25 @@ class LSEnsemble(nn.Module):
                     self.output_mode
                 ) for _ in range(self.num_experts)
             ])
+    """        
+    def initialize_experts(self, input_size):
+         if self.base_learner == 'FAMLP': # Use Full AsymmetricMLP 
+             # Create experts with the actual input size
+                self.experts = nn.ModuleList()
+                for i in range(self.num_experts):
+                    # Same seed as Code 1
+                    torch.manual_seed(42 + i)
+                    
+                    expert = AsymmetricMLP(
+                        input_size,
+                        self.hidden_size,
+                        self.alpha,
+                        self.beta,
+                        self.drop_out,
+                        self.activation_fn,
+                        self.output_mode
+                    )
+                    self.experts.append(expert)
             
     def generate_experts_data(self, x, y, w=None, Q_RB_S=1, RB_each_expert=True):
         """
@@ -712,7 +762,7 @@ class LSEnsemble(nn.Module):
         if isinstance(y_train, np.ndarray):
             y_train = torch.from_numpy(y_train).float()  # Use float to handle potential binary labels
     
-        # Handle sample_weight
+        # Handle sample_weight once at the beginning
         if sample_weight is not None:
             if isinstance(sample_weight, np.ndarray):
                 sample_weight = torch.from_numpy(sample_weight).float()
@@ -721,7 +771,6 @@ class LSEnsemble(nn.Module):
             sample_weight = torch.ones_like(y_train, dtype=torch.float32)
             
         # Ensure the data is on the same device as the model
-        # Check if model parameters exist and get the device, otherwise fallback to CPU
         if len(list(self.parameters())) > 0:
             device = next(self.parameters()).device
         else:
@@ -731,20 +780,13 @@ class LSEnsemble(nn.Module):
         y_train = y_train.to(device)
         sample_weight = sample_weight.to(device)
         
+        # Generate internal data for experts
         self.generate_experts_data(x_train, y_train, sample_weight,
                                    Q_RB_S=self.Q_RB_S,
                                    RB_each_expert=False)
         
-        # Optional: Set sample weights to experts if provided
-        if sample_weight is not None:
-            if isinstance(sample_weight, np.ndarray):
-                sample_weight = torch.from_numpy(sample_weight).float()
-            sample_weight = sample_weight.to(device)
-            self.fit_expert_model(sample_weight, epochs=self.n_epoch, batch_size=self.n_batch, optim=self.optim)
-        else:
-            # If no sample weights are provided, call fit_expert_model with default weights
-            default_weights = torch.ones(y_train.shape[0]).float().to(device)
-            self.fit_expert_model(default_weights, epochs=self.n_epoch, batch_size=self.n_batch, optim=self.optim)
+        # Fit expert models using the already processed sample_weight
+        self.fit_expert_model(sample_weight, epochs=self.n_epoch, batch_size=self.n_batch, optim=self.optim)
         
         return self
                 
@@ -767,7 +809,7 @@ class LSEnsemble(nn.Module):
     
         # Compute weights for each expert
         for i, expert in enumerate(self.experts):
-            weights[:, i] = compute_weights(expert.y, RI_C=self.Q_RB_C, Q_P=self.QP_tr, mode='normal') * expert.w  # Scale by training weights
+            weights[:, i] = compute_weights(expert.y, RI_C=self.Q_RB_C, Q_P=self.QP_tr, mode='normal') * expert.w  / self.num_experts # Scale by training weights
     
         # Training loop for experts
         if optim == 'lbfgs':
@@ -874,17 +916,18 @@ class LSEnsemble(nn.Module):
         QP_tr = self.QP_tr
         Q_tr = self.QC * self.QP_tr
         
-        Q_RB_C = self.Q_RB_C
-        Q_RB_S = self.Q_RB_S
+        Q_RB_C = min(1, self.Q_RB_C) # self.Q_RB_C # 
+        Q_RB_S = min(1, self.Q_RB_S) # self.Q_RB_S #
         
         QR_tr = max(1, QP_tr / (Q_RB_C * Q_RB_S))
+        Q_ratio = (Q_tr / (Q_tr + QR_tr)) # 1/2 # 
                
         # Get the averaged expert predictions (o_pred)
         o_pred = self.forward(x)
     
         # Apply thresholding to get the final class labels
         y = np.ones_like(o_pred)
-        eta_th = (2 * (self.alpha + (1 - self.alpha - self.beta) * (Q_tr / (Q_tr + QR_tr))) - 1)
+        eta_th = (2 * (self.alpha + (1 - self.alpha - self.beta) * Q_ratio) - 1)
         y[o_pred < eta_th] = self.bin_format
         
         return y.astype(int)
