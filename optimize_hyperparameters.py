@@ -23,8 +23,8 @@ METRIC_FUNCTIONS = {
 }
 
 from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import StandardScaler
-
 
 # Custom Libraries
 from libraries.ecoc import ECOC
@@ -32,7 +32,7 @@ from libraries.data_loading import load_datasets
 from libraries.functions import load_config, setup_logger, get_class_from_string
 from libraries.functions import generate_model_configurations, apply_ecoc_binarization
 
-from libraries.functions import compute_imbalance_ratio, estimate_alpha, get_inner_cv
+from libraries.functions import compute_imbalance_ratio, estimate_alpha
 from libraries.imbalance_degree import imbalance_degree
 
 # Suppress ConvergenceWarnings
@@ -102,9 +102,9 @@ model_list = config["models"]
 
 # Apply the desired selection here (uncomment only one option)
 # model_list = config["models"]  # All models
-model_list = [config["models"][i] for i in [1, 4, 7, 3]]
+# model_list = [config["models"][i] for i in [1, 4, 7, 3]]
 model_list = [config["models"][2]] # Only ALSE
-model_list = [config["models"][0]] # Only LogReg
+# model_list = [config["models"][0]] # Only LogReg
 
 # Generate Model Configurations
 CV_config = generate_model_configurations(model_list)
@@ -212,18 +212,45 @@ for dataset_name, (X, y, C0) in datasets.items():
         X_test_n = scaler.transform(X_test)
         
         # Inner n-Fold for validation
-        inner_cv = get_inner_cv(
-            num_folds=num_folds,
-            random_state=42 + k_simu
+        # Inner CV / hold-out logic (simplified and consistent)
+        if num_folds > 1:
+            # Stratified K-Fold: divides X_train into multiple folds
+            inner_cv = StratifiedKFold(
+                n_splits=num_folds,
+                shuffle=True,
+                random_state=42 + k_simu
             )
+        else:
+            # For num_folds == 1: use a dummy splitter that returns full train + empty val
+            class FullTrainSplitter:
+                def __init__(self, n_samples):
+                    self.n_samples = n_samples
+                
+                def split(self, X, y=None, groups=None):
+                    yield np.arange(self.n_samples, dtype=np.int64), np.array([], dtype=np.int64)
+            
+            inner_cv = FullTrainSplitter(n_samples=X_train_n.shape[0])
         
-        for nFold, (train_index, val_index) in enumerate(inner_cv.split(X_train, y_train), 1):
+        # Bucle interno uniforme (sin if num_folds)
+        for nFold, (train_index, val_index) in enumerate(inner_cv.split(X_train_n, y_train), 1):
             if verbose:
                 logger.info(f"Simulation {k_simu+1}. Inner Fold {nFold}:")
-
-            X_train_cv, X_test_cv = X_train_n[train_index], X_train_n[val_index]
-            y_train_cv, y_test_cv = y_train[train_index], y_train[val_index]
             
+            # Always use train_index for training
+            X_train_cv = X_train_n[train_index]
+            y_train_cv = y_train[train_index]
+            
+            # If there is a validation set (only when num_folds > 1)
+            if len(val_index) > 0:
+                X_test_cv = X_train_n[val_index]
+                y_test_cv = y_train[val_index]
+                # Use validation for metric/BIC/etc.
+                # e.g., val_metric = f_sel(y_val_cv, model.predict(X_val_cv))
+            else:
+                # num_folds == 1 → no validation set → train with full X_train
+                X_test_cv = X_test_n
+                y_test_cv = y_test
+
             # Apply ECOC binarization
             Ye_train, Ye_test, flag_swap, idx_train_ecoc, idx_test_ecoc = apply_ecoc_binarization(M, y_train_cv, y_test_cv, apply_flag_swap = flg_swp)
                 

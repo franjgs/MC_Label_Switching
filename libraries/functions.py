@@ -16,44 +16,6 @@ import random
 from sklearn.metrics import f1_score, cohen_kappa_score, matthews_corrcoef
 from sklearn.metrics import accuracy_score, balanced_accuracy_score
 
-from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit
-
-
-def get_inner_cv(num_folds, random_state):
-    """
-    Returns a consistent inner CV splitter that always supports the loop:
-    
-    for nFold, (train_index, val_index) in enumerate(inner_cv.split(X, y), 1):
-    
-    - If num_folds > 1: StratifiedKFold (multiple folds, ~80/20 per fold)
-    - If num_folds == 1: StratifiedShuffleSplit with test_size=0 → 
-      train_index = all indices, val_index = empty array
-      (effectively train on 100% of the data, no internal validation split)
-    
-    Args:
-        num_folds (int): Number of folds (>1 = CV, ==1 = full train)
-        validation_size (float): Ignored when num_folds==1 (set to 0 internally)
-        random_state (int): Seed for reproducibility
-    
-    Returns:
-        CV splitter object (always iterable with .split())
-    """
-    if num_folds > 1:
-        # Standard stratified CV
-        return StratifiedKFold(
-            n_splits=num_folds,
-            shuffle=True,
-            random_state=random_state
-        )
-    else:
-        # Simulate "no split": train on 100% of data, val_index = empty
-        # StratifiedShuffleSplit with test_size=0 returns full train, empty val
-        return StratifiedShuffleSplit(
-            n_splits=1,
-            test_size=0.0,  # Key: 0.0 → val_index will be empty array
-            random_state=random_state
-        )
-
 def compute_imbalance_ratio(targets):
     """
     Computes the imbalance ratio (majority class count / minority class count)
