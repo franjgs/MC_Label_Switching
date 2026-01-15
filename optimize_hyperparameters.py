@@ -22,15 +22,8 @@ METRIC_FUNCTIONS = {
     "matthews_corrcoef": matthews_corrcoef,
 }
 
-from sklearn.model_selection import (
-    KFold,
-    train_test_split,
-   StratifiedKFold,
-   StratifiedShuffleSplit
-)
-from sklearn.preprocessing import (
-    StandardScaler,
-)
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
 
 
 # Custom Libraries
@@ -39,7 +32,7 @@ from libraries.data_loading import load_datasets
 from libraries.functions import load_config, setup_logger, get_class_from_string
 from libraries.functions import generate_model_configurations, apply_ecoc_binarization
 
-from libraries.functions import compute_imbalance_ratio, estimate_alpha
+from libraries.functions import compute_imbalance_ratio, estimate_alpha, get_inner_cv
 from libraries.imbalance_degree import imbalance_degree
 
 # Suppress ConvergenceWarnings
@@ -111,6 +104,7 @@ model_list = config["models"]
 # model_list = config["models"]  # All models
 model_list = [config["models"][i] for i in [1, 4, 7, 3]]
 model_list = [config["models"][2]] # Only ALSE
+model_list = [config["models"][0]] # Only LogReg
 
 # Generate Model Configurations
 CV_config = generate_model_configurations(model_list)
@@ -217,10 +211,12 @@ for dataset_name, (X, y, C0) in datasets.items():
         X_train_n = scaler.transform(X_train)
         X_test_n = scaler.transform(X_test)
         
-        # Inner 5-Fold for validation
-        # inner_cv = KFold(n_splits=num_folds, shuffle=True, random_state=42+k_simu)
-        # inner_cv = StratifiedKFold(n_splits=num_folds, shuffle=True, random_state=42+k_simu)
-        inner_cv = StratifiedShuffleSplit(n_splits=1, test_size=0.01*Test_size, random_state=42+k_simu)
+        # Inner n-Fold for validation
+        inner_cv = get_inner_cv(
+            num_folds=num_folds,
+            random_state=42 + k_simu
+            )
+        
         for nFold, (train_index, val_index) in enumerate(inner_cv.split(X_train, y_train), 1):
             if verbose:
                 logger.info(f"Simulation {k_simu+1}. Inner Fold {nFold}:")
