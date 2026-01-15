@@ -15,7 +15,6 @@ import pickle
 import time
 import numpy as np
 import pandas as pd
-import torch
 
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
@@ -321,8 +320,6 @@ for dataset_name, (X, y, C0) in datasets.items():
             "avg_sensitivity": np.mean(sensitivity_simulations), "std_sensitivity": np.std(sensitivity_simulations),
             "avg_f1_score": np.mean(f1_simulations), "std_f1_score": np.std(f1_simulations),
         }
-        # Store the class labels for proper interpretation later
-        model_metrics["class_labels"] = class_labels.tolist()
         
         # Existing multiclass metrics from the input PKL (old evaluation)
         old_metrics = result_data.get('multiclass_metrics', None)
