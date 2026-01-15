@@ -308,7 +308,7 @@ for dataset_name, (X, y, C0) in datasets.items():
                         for combination in product(*param_grid.values()):
                             CV_config[model_name].append(dict(zip(param_grid.keys(), combination)))
                         
-                        CV_config_full[model_name][j_dic] = CV_config[model_name]
+                    CV_config_full[model_name][j_dic] = CV_config[model_name]
                 
                     k_conf = 0
                     for cv_config in CV_config[model_name]:
