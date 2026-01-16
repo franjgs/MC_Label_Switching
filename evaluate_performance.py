@@ -338,15 +338,12 @@ for dataset_name, (X, y, C0) in datasets.items():
             "avg_f1_score": np.mean(f1_simulations), "std_f1_score": np.std(f1_simulations),
         }
 
+        result_data["multiclass_metrics"] = model_metrics  
         # Always update runtime (it's new information)
         result_data["execution_time_seconds"] = np.mean(runtime_simulations)        # total time 
         # Normalize by number of dichotomies (makes it comparable across datasets)
         result_data["execution_time_per_dichotomy"] = result_data["execution_time_seconds"] / num_dichotomies   # normalized (more useful)
     
-        if result_data['multiclass_metrics']:
-            if result_data['multiclass_metrics']['avg_bal_acc'] < model_metrics['avg_bal_acc']:
-                result_data["multiclass_metrics"] = model_metrics  
-                
         new_metrics = result_data["multiclass_metrics"] 
         logger.info(f"Balanced Accuracy: {new_metrics['avg_bal_acc']:.5f} ± {new_metrics['std_bal_acc']:.5f}")
         logger.info(f"Geo Mean: {new_metrics['avg_geom_mean']:.5f} ± {new_metrics['std_geom_mean']:.5f}")

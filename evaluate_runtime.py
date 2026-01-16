@@ -90,7 +90,7 @@ model_list = config["models"]
 # Apply the desired selection here (uncomment only one option)
 # model_list = config["models"]  # All models
 model_list = [config["models"][i] for i in [1, 4, 7, 3]]
-# model_list = [config["models"][2]] # Only ALSE
+model_list = [config["models"][2]] # Only ALSE
 # model_list = [config["models"][0]] # Only LogReg
 
 
@@ -377,11 +377,7 @@ for dataset_name, (X, y, C0) in datasets.items():
         # Always update runtime (it's new information)
         result_data["execution_time_seconds"] = np.mean(runtime_simulations)        # total time 
         # Normalize by number of dichotomies (makes it comparable across datasets)
-        result_data["execution_time_per_dichotomy"] = result_data["execution_time_seconds"] / num_dichotomies   # normalized (more useful)
-    
-        if result_data['multiclass_metrics']:
-            if result_data['multiclass_metrics']['avg_bal_acc'] < model_metrics['avg_bal_acc']:
-                result_data["multiclass_metrics"] = model_metrics  
+        result_data["execution_time_per_dichotomy"] = result_data["execution_time_seconds"] / num_dichotomies   # normalized (more useful) 
                 
         new_metrics = result_data["multiclass_metrics"] 
         logger.info(f"Balanced Accuracy: {new_metrics['avg_bal_acc']:.5f} ± {new_metrics['std_bal_acc']:.5f}")
