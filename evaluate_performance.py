@@ -15,7 +15,6 @@ import pickle
 import time
 import numpy as np
 import pandas as pd
-import torch
 
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
@@ -256,12 +255,29 @@ for dataset_name, (X, y, C0) in datasets.items():
                     cv_config = best_model_config[j_dic][0] 
                     model = model_class(**cv_config)
                     
-                    if model_name in ["MLPClassifier","kNN", "MultiRandBal"]:
+                    # Train the model
+                    if model_name in ["MLPClassifier", "kNN", "MultiRandBal"]:
                         model.fit(x_train, ye_train)
+                        # Evaluate the model
+                        ye_pred = model.predict(x_test)
+                    elif model_name == "LGBMClassifier":
+                        # Create feature names for consistency (f0, f1, ...)
+                        feature_names = [f'f{i}' for i in range(x_train.shape[1])]
+                        
+                        # Convert training and validation/test sets to pandas DataFrame
+                        x_train_df = pd.DataFrame(x_train, columns=feature_names)
+                        x_test_df = pd.DataFrame(x_test, columns=feature_names)
+                        
+                        # Train the model using DataFrame (eliminates the warning)
+                        model.fit(x_train_df, ye_train, sample_weight=cw_train)
+                        
+                        # Predict using DataFrame
+                        y_pred = model.predict(x_test_df)
                     else:
                         model.fit(x_train, ye_train, sample_weight=cw_train)
-                    
-                    ye_pred = model.predict(x_test)
+                        # Evaluate the model
+                        ye_pred = model.predict(x_test)
+                        
                     if flag_swap_test[j_dic]:
                         ye_pred *= -1
                     Ye_pred[:, j_dic] = ye_pred

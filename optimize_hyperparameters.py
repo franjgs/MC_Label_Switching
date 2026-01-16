@@ -103,8 +103,8 @@ model_list = config["models"]
 # Apply the desired selection here (uncomment only one option)
 # model_list = config["models"]  # All models
 # model_list = [config["models"][i] for i in [1, 4, 7, 3]]
-model_list = [config["models"][2]] # Only ALSE
-# model_list = [config["models"][0]] # Only LogReg
+# model_list = [config["models"][2]] # Only ALSE
+model_list = [config["models"][7], config["models"][3]] 
 
 # Generate Model Configurations
 CV_config = generate_model_configurations(model_list)
@@ -264,6 +264,19 @@ for dataset_name, (X, y, C0) in datasets.items():
                 unique_labels_test = unique_labels[np.isin(unique_labels, ye_test)]
                 
                 if len(unique_labels_train) < 2:
+                    for model_item in model_list:
+                        model_name = model_item["name"]
+                        CV_config_full[model_name][j_dic] = CV_config[model_name]
+                        
+                        k_conf = 0 # Default configuration
+                        ye_pred = ye_test
+                        metric = 1.0 if np.array_equal(ye_test, ye_pred) else 0.0  # Fallback metric                    
+                        metric_conf[model_name][k_conf, j_dic, nFold-1, k_simu] = metric
+                        CM = confusion_matrix(ye_test, ye_pred, labels=np.array([-1,1]))
+                        CM_accumulated[model_name][j_dic][k_conf] += CM
+                        best_metric_peak[model_name][j_dic] = metric
+                        best_model_peak[model_name][j_dic] = [CV_config[model_name][k_conf], metric, CM]
+                       
                     continue
 
                 QP_tr[j_dic] = compute_imbalance_ratio(ye_train)
@@ -341,21 +354,38 @@ for dataset_name, (X, y, C0) in datasets.items():
                         # Train the model
                         if model_name in ["MLPClassifier", "kNN", "MultiRandBal"]:
                             model.fit(x_train, ye_train)
+                            # Evaluate the model
+                            ye_pred = model.predict(x_test)
+                        elif model_name == "LGBMClassifier":
+                            # Create feature names for consistency (f0, f1, ...)
+                            feature_names = [f'f{i}' for i in range(x_train.shape[1])]
+                            
+                            # Convert training and validation/test sets to pandas DataFrame
+                            x_train_df = pd.DataFrame(x_train, columns=feature_names)
+                            x_test_df = pd.DataFrame(x_test, columns=feature_names)
+                            
+                            # Train the model using DataFrame (eliminates the warning)
+                            model.fit(x_train_df, ye_train, sample_weight=cw_train)
+                            
+                            # Predict using DataFrame
+                            y_pred = model.predict(x_test_df)
                         else:
                             model.fit(x_train, ye_train, sample_weight=cw_train)
-    
-                        # Evaluate the model
-                        ye_pred = model.predict(x_test)
+                            # Evaluate the model
+                            ye_pred = model.predict(x_test)
                             
-                        CM = confusion_matrix(ye_test, ye_pred, labels=unique_labels)
-                        CM_accumulated[model_name][j_dic][k_conf] += CM
-                                                      
                         if len(unique_labels_test) == 1:
                             if len(np.unique(ye_pred)) == 2:
+                                CM = confusion_matrix(ye_test, ye_pred, labels=unique_labels)
+                                CM_accumulated[model_name][j_dic][k_conf] += CM
                                 metric = f_sel(ye_pred, ye_test)  # Swap order to avoid warning
                             else:
-                                metric = 1.0 if np.array_equal(ye_test, ye_pred) else 0.0  # Fallback metric
+                                CM = confusion_matrix(ye_test, ye_pred, labels=np.array([-1,1]))
+                                CM_accumulated[model_name][j_dic][k_conf] += CM
+                                metric = 1.0 if np.array_equal(ye_test, ye_pred) else 0  # Fallback metric
                         else:
+                            CM = confusion_matrix(ye_test, ye_pred, labels=unique_labels)
+                            CM_accumulated[model_name][j_dic][k_conf] += CM
                             metric = f_sel(ye_test, ye_pred)
 
                         metric_conf[model_name][k_conf, j_dic, nFold-1, k_simu] = metric
