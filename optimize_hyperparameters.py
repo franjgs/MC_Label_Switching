@@ -368,7 +368,7 @@ for dataset_name, (X, y, C0) in datasets.items():
                             model.fit(x_train_df, ye_train, sample_weight=cw_train)
                             
                             # Predict using DataFrame
-                            y_pred = model.predict(x_test_df)
+                            ye_pred = model.predict(x_test_df)
                         else:
                             model.fit(x_train, ye_train, sample_weight=cw_train)
                             # Evaluate the model
