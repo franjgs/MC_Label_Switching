@@ -92,6 +92,7 @@ model_list = config["models"]
 model_list = [config["models"][i] for i in [1, 4, 7, 3]]
 model_list = [config["models"][2]] # Only ALSE
 # model_list = [config["models"][0]] # Only LogReg
+model_list = [config["models"][i] for i in [7, 3]]
 
 
 # Load Datasets
@@ -339,53 +340,69 @@ for dataset_name, (X, y, C0) in datasets.items():
             "avg_sensitivity": np.mean(sensitivity_simulations), "std_sensitivity": np.std(sensitivity_simulations),
             "avg_f1_score": np.mean(f1_simulations), "std_f1_score": np.std(f1_simulations),
         }
+
+        # Safely retrieve previous metrics from the input PKL
+        old_metrics = result_data.get('multiclass_metrics', {})
         
-        # Existing multiclass metrics from the input PKL (old evaluation)
-        old_metrics = result_data.get('multiclass_metrics', None)
+        # Extract previous balanced accuracy and std safely
+        # We default to -np.inf for the mean and 0.0 for std to ensure the first run updates
+        old_bal_acc = old_metrics.get('avg_bal_acc', -np.inf)
+        old_bal_acc_std = old_metrics.get('std_bal_acc', 0.0)
+        
+        # Extract current evaluation metrics
+        new_bal_acc = model_metrics['avg_bal_acc']
+        new_bal_acc_std = model_metrics['std_bal_acc']
+        
+        # Calculate Conservative Scores (Lower Bound)
+        # Formula: Mean - Std. Represents the reliable performance "floor".
+        old_score = old_bal_acc - old_bal_acc_std
+        new_score = new_bal_acc - new_bal_acc_std
         
         update_metrics = False
+        reason = ""
         
-        if old_metrics is not None and 'avg_bal_acc' in old_metrics:
-            old_bal_acc = old_metrics['avg_bal_acc']
-            old_bal_acc_std = old_metrics.get('std_bal_acc', np.nan)
-            
-            new_bal_acc = model_metrics['avg_bal_acc']
-            new_bal_acc_std = model_metrics['std_bal_acc']
-            
-            # Criterion: update if new mean is better AND not much more variable
-            if new_bal_acc > old_bal_acc:
-                if new_bal_acc_std <= 1.5 * old_bal_acc_std or np.isnan(old_bal_acc_std):
-                    update_metrics = True
-                    reason = f"Improved balanced acc: {old_bal_acc:.4f} → {new_bal_acc:.4f}"
-                else:
-                    reason = f"Not updated: better mean ({new_bal_acc:.4f} > {old_bal_acc:.4f}) but higher variance"
-            else:
-                reason = f"Not updated: worse balanced acc ({new_bal_acc:.4f} ≤ {old_bal_acc:.4f})"
-        else:
-            # No previous metrics → always update (first evaluation)
+        # --- Decision Logic ---
+        
+        # 1. Check for initial/invalid state
+        if old_bal_acc <= 0 or old_bal_acc == -np.inf:
             update_metrics = True
-            reason = "No previous metrics found → using current evaluation"
+            reason = f"Initial update (No previous valid data). New BAcc: {new_bal_acc:.4f}"
+        else:
+            # 2. Check if the performance "floor" has improved
+            # This allows a massive jump (e.g., 0.4 to 0.7) even if variance increases
+            if new_score > old_score:
+                update_metrics = True
+                reason = (f"Performance floor improved: {old_score:.4f} -> {new_score:.4f} | "
+                          f"Old: {old_bal_acc:.4f} ± {old_bal_acc_std:.4f} | "
+                          f"New: {new_bal_acc:.4f} ± {new_bal_acc_std:.4f}")
+            else:
+                # 3. Reject if the model is too unstable or has worse average
+                reason = (f"New floor {new_score:.4f} is not better than old floor {old_score:.4f} | "
+                          f"Old: {old_bal_acc:.4f} ± {old_bal_acc_std:.4f} | "
+                          f"New: {new_bal_acc:.4f} ± {new_bal_acc_std:.4f}")
         
-        # Update if criteria met
+        # --- Apply update and log results ---
         if update_metrics:
-            result_data["multiclass_metrics"] = model_metrics.copy()  # .copy() to avoid reference issues
+            result_data["multiclass_metrics"] = model_metrics.copy()
             logger.info(f"Multiclass metrics UPDATED: {reason}")
         else:
             logger.info(f"Multiclass metrics NOT updated: {reason}")
-            logger.info(f"Keeping previous balanced acc: {old_bal_acc:.4f} ± {old_bal_acc_std:.4f}")
-        
+            if old_bal_acc > -np.inf:
+                logger.info(f"Keeping previous results: {old_bal_acc:.4f} ± {old_bal_acc_std:.4f}")
+                       
+        # Safely retrieve final metrics for logging (fallback to current if needed)
+        final_metrics = result_data.get("multiclass_metrics", model_metrics)
+
         # Always update runtime (it's new information)
         result_data["execution_time_seconds"] = np.mean(runtime_simulations)        # total time 
         # Normalize by number of dichotomies (makes it comparable across datasets)
         result_data["execution_time_per_dichotomy"] = result_data["execution_time_seconds"] / num_dichotomies   # normalized (more useful) 
                 
-        new_metrics = result_data["multiclass_metrics"] 
-        logger.info(f"Balanced Accuracy: {new_metrics['avg_bal_acc']:.5f} ± {new_metrics['std_bal_acc']:.5f}")
-        logger.info(f"Geo Mean: {new_metrics['avg_geom_mean']:.5f} ± {new_metrics['std_geom_mean']:.5f}")
+        logger.info(f"Balanced Accuracy: {final_metrics['avg_bal_acc']:.5f} ± {final_metrics['std_bal_acc']:.5f}")
+        logger.info(f"Geo Mean: {final_metrics['avg_geom_mean']:.5f} ± {final_metrics['std_geom_mean']:.5f}")
         logger.info(f"Avg Runtime: {result_data['execution_time_seconds'] :.4f} s")
         logger.info(f"Avg Runtime per dichotomy: {result_data['execution_time_per_dichotomy']:.4f} s")
-
-        
+      
         with open(file_path_o, 'wb') as f:
             pickle.dump(result_data, f)
             
