@@ -18,46 +18,42 @@ from sklearn.metrics import accuracy_score, balanced_accuracy_score
 
 def compute_imbalance_ratio(targets):
     """
-    Computes the imbalance ratio (majority class count / minority class count)
-    for binary targets, handling cases with values 0 and 1, or False and True.
-
-    Args:
-        targets (np.ndarray): Array of binary target values. Can contain:
-            - -1 and 1
-            - 0 and 1
-            - False and True
-
+    Computes the imbalance ratio (Majority Count / Minority Count).
+    Supports asymmetric targets: -(1-2*alpha) and (1-2*beta).
+    
     Returns:
-        float: The imbalance ratio. Returns 1 if classes are balanced or if
-               only one class is present. Returns np.inf if only the minority
-               class is present.
+        float: (n_majority / n_minority). 
+               Returns 1000.0 if only the majority class is present.
+               Returns 1.0 if perfectly balanced or empty.
     """
-    if targets.dtype == bool:
-        negative_label = False
-        positive_label = True
+    unique_values, counts = np.unique(targets, return_counts=True)
+    n_unique = len(unique_values)
+
+    inf = np.inf
+    if n_unique == 0:
+        return 1.0
+    
+    if n_unique == 1:
+        # If only one class exists, we assume it's the majority 
+        # because the minority is, by definition, rare or missing.
+        return inf
+    elif n_unique == 2:
+        # Sort classes by count: counts[0] is the smaller count if we sort
+        sorted_indices = np.argsort(counts)
+        n_minority = counts[sorted_indices[0]]
+        n_majority = counts[sorted_indices[1]]
+    
+        # Map which value belongs to which class for internal logic if needed
+        # minority_val = unique_values[sorted_indices[0]]
+        # majority_val = unique_values[sorted_indices[1]]
+    
+        if n_minority == 0:
+            return inf
+        
+        imbalance_ratio = n_majority / n_minority
+        return float(imbalance_ratio)
     else:
-        negative_label = 0
-        positive_label = 1
-        if -1 in targets:
-            negative_label = -1
-            positive_label = 1
-
-    n_negative = np.sum(targets == negative_label)
-    n_positive = np.sum(targets == positive_label)
-
-    if n_positive == 0 and n_negative == 0:
-        return 1.0  # No data
-    elif n_positive == 0:
-        return np.inf  # Only negative class (majority)
-    elif n_negative == 0:
-        return 1000 # Only positive class (minority)
-
-    if n_negative >= n_positive:
-        imbalance_ratio = n_negative / n_positive
-    else:
-        imbalance_ratio = n_positive / n_negative
-
-    return imbalance_ratio
+        return None
 
 def get_class_from_string(class_path):
     """Converts a string class path to a class object."""
@@ -98,7 +94,7 @@ def generate_model_configurations(model_list):
         CV_config[model_name] = []
 
         # LSEnsemble optimization logic
-        if model_name == 'LSEnsemble':
+        if 'LSEnsemble' in model_name:
             SW_optimization = model_item['LSE_optimization']['SW']
             QC_optimization = model_item['LSE_optimization']['QC']
             RI_C_optimization = model_item['LSE_optimization']['RI_C']
@@ -188,7 +184,7 @@ def generate_model_configurations(model_list):
                     "learning_rate": param_dict['LGBM_learning_rate'],
                     "n_estimators": param_dict['LGBM_n_estimators'],
                 })
-            elif model_name == "LSEnsemble":
+            elif 'LSEnsemble' in model_name:
                 updated_config.update({
                     "alpha": param_dict['LS_alpha'],
                     "beta": param_dict['LS_beta'],

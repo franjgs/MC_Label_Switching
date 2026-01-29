@@ -364,7 +364,7 @@ for dataset_name, (X, y, C0) in datasets.items():
             "execution_time_per_simulation": np.mean(runtime_simulations) / n_simus_test,
         }
         
-        filename_o = f"{dataset_name}_{model_name}_native_test.pkl"
+        filename_o = f"{dataset_name}_native_{model_name}_test.pkl"
         file_path_o = os.path.join(output_path, filename_o)
         
         with open(file_path_o, 'wb') as f:

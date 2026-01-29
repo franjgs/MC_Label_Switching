@@ -84,6 +84,7 @@ model_list = config["models"]
 # - C4.5: index 6 – Decision tree with entropy criterion (C4.5 approximation)
 # - SVM: index 7 – Support Vector Machine with RBF kernel
 # - MultiRandBal: index 8 – Ensemble with SMOTE oversampling + random undersampling
+# - LSEnsemble Calibrated: index 9 – ALSE Calibrated 
 
 # Examples of selection (uncomment the desired line):
 
@@ -102,9 +103,9 @@ model_list = config["models"]
 
 # Apply the desired selection here (uncomment only one option)
 # model_list = config["models"]  # All models
-# model_list = [config["models"][i] for i in [1, 4, 7, 3]]
-# model_list = [config["models"][2]] # Only ALSE
-model_list = [config["models"][7], config["models"][3]] 
+model_list = [config["models"][i] for i in [1, 4, 7, 3]]
+model_list = [config["models"][2]] # Only ALSE
+
 
 # Generate Model Configurations
 CV_config = generate_model_configurations(model_list)
@@ -117,6 +118,10 @@ datasets = load_datasets(data_path, N_max, dataset_special_cases)
 for dataset_name, (X, y, C0) in datasets.items():
     n_samples, n_attributes = X.shape
     nclass = np.unique(y).shape[0]
+    logger.info('')
+    logger.info('---------------------------------------------------------------------')
+    logger.info(f'Dataset: {dataset_name}.')
+    logger.info(f'Number of classes: {nclass}. Number of samples: {n_samples}. Dimensionality: {n_attributes}')
     if nclass > 2:
         if maj_min:
             sorted_classes = pd.Series(y).value_counts().index.to_list()
@@ -128,25 +133,22 @@ for dataset_name, (X, y, C0) in datasets.items():
             class_dict = {k + 1: k + 1 for k in range(nclass)}
         
         y = np.vectorize(class_dict.get)(y)
-
+        IB_degree = imbalance_degree(y, "EU")
+        
         class_labels = np.array(sorted(class_dict.keys()))
-    
         M_ecoc = ECOC(encoding=ECOC_enc, labels=class_labels)
         M = (M_ecoc._code_matrix > 0).astype(int)
-    
         if True:
             M[M == 1] = -C0
             M[M == 0] = C0
-    
         M_ecoc._code_matrix = M
-    
         num_dichotomies = M_ecoc._code_matrix.shape[1]
-        IB_degree = imbalance_degree(y, "EU")
     elif nclass == 2:
         # Ensure -1 is the label for the majority class
         if np.sum(y == -1) < np.sum(y == 1):
             y = -y  # Swap -1 and +1
-
+        IB_degree = compute_imbalance_ratio(y)
+        
         class_labels = np.unique(y)
         M_ecoc = ECOC(encoding=ECOC_enc, labels=class_labels)
         M = (M_ecoc._code_matrix > 0).astype(int)
@@ -154,18 +156,15 @@ for dataset_name, (X, y, C0) in datasets.items():
         M[M == 0] = C0
         M_ecoc._code_matrix = M
         num_dichotomies = M_ecoc._code_matrix.shape[1]
-        IB_degree = compute_imbalance_ratio(y)
+        
         # Convert binary labels -1 and +1 to 1 and 2
         label_map_binary = {-1: 1, 1: 2}
         y = np.array([label_map_binary[label] for label in y])
     else:
         raise ValueError(f"Number of classes ({nclass}) must be greater than or equal to 2.")
         
-    logger.info('')
-    logger.info('-----------------------------------------------------')
-    logger.info(f'Dataset: {dataset_name}. Imbalance Degree = {IB_degree:.2f}')
     logger.info(f'ECOC encoding: {M_ecoc.encoding}. Flag swap: {flg_swp}')
-    logger.info(f'Number of classes: {nclass}. Number of Dichotomies: {num_dichotomies}')
+    logger.info(f'Number of Dichotomies: {num_dichotomies}. Imbalance Degree = {IB_degree:.2f}')
     logger.info('f_sel: '+f_sel.__name__)
     
     CV_config_full = {}
@@ -179,7 +178,7 @@ for dataset_name, (X, y, C0) in datasets.items():
         model_name = model_item["name"]
         logger.info(f'Model: {model_name}')
 
-        if model_name == 'LSEnsemble':
+        if 'LSEnsemble' in model_name:
             SW_optimization = model_item['LSE_optimization']['SW']
             QC_optimization = model_item['LSE_optimization']['QC']
             RI_C_optimization = model_item['LSE_optimization']['RI_C']
@@ -289,7 +288,7 @@ for dataset_name, (X, y, C0) in datasets.items():
                 for model_item in model_list:
                     model_name = model_item["name"]
                     model_class = get_class_from_string(model_item["class"])
-                    if model_name == "LSEnsemble":
+                    if 'LSEnsemble' in model_name:
                         if model_item['LSE_optimization']['RI_C']:
                             # Cost: auto
                             if model_item['params']['Q_RB_C_mode'] == "auto":
@@ -390,10 +389,10 @@ for dataset_name, (X, y, C0) in datasets.items():
 
                         metric_conf[model_name][k_conf, j_dic, nFold-1, k_simu] = metric
     
-                        if metric >= best_metric_peak[model_name][j_dic]:
+                        if metric > best_metric_peak[model_name][j_dic]:
                             best_metric_peak[model_name][j_dic] = metric
                             best_model_peak[model_name][j_dic] = [cv_config, metric, CM]
-                            if model_selection == "peak" and verbose:
+                            if verbose and model_selection == "peak":
                                 logger.info(f'  Model: {model_name}. Dichotomy: {j_dic+1}')
                                 logger.info(f'      Best configuration (peak): {cv_config}')
                                 logger.info(f'      Best metric (peak): {best_metric_peak[model_name][j_dic]:.5f}')
@@ -467,7 +466,7 @@ for dataset_name, (X, y, C0) in datasets.items():
         }
     
         # Generate filename based on dataset and model
-        if model_name == 'LSEnsemble':
+        if 'LSEnsemble' in model_name:
             SW_optimization = model_item['LSE_optimization']['SW']
             QC_optimization = model_item['LSE_optimization']['QC']
             RI_C_optimization = model_item['LSE_optimization']['RI_C']
