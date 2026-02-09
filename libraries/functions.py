@@ -536,7 +536,7 @@ def estimate_alpha(ir: float, cap: bool = True) -> float:
     if ir <= 1.0:
         return 0.08  # Minimum reasonable value for nearly balanced cases
     
-    alpha_est = 0.12 * np.log10(ir) + 0.08
+    alpha_est = 0.2 * np.log10(ir) + 0.1
     
     if cap:
         alpha_est = min(alpha_est, 0.45)
