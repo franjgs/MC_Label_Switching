@@ -10,14 +10,15 @@ simulation:
   flg_swp: true
   maj_min: false
   min_maj: false
-  n_simus: 1
+  n_simus: 5
   test_size: 25
-  N_MAX: 500
+  N_MAX: 8000
   num_folds: 1
   model_selection: avg
+  
 
 paths:
-  data_folder: datasets_lowC_complete
+  data_folder: datasets
   output_folder: results_smoke
 
 models:
@@ -56,9 +57,16 @@ models:
           mode: random
 
           early_stopping: false
-          lbfgs_max_iter: 80
-          lbfgs_max_eval: 100
+          lbfgs_max_iter: 150
+          lbfgs_max_eval: 150
 
+    # ------------------------------------------------------------------
+    # Label Switching Ensemble optimization flags
+    # ------------------------------------------------------------------
+    # SW   : optimize / use switching mechanism.
+    # QC   : optimize cost ratio QC if enabled.
+    # RI_C : optimize classification rebalancing factor if enabled.
+    # RI_P : optimize population / neutral rebalancing factor if enabled.
     LSE_optimization:
       SW: true
       QC: false
@@ -66,9 +74,21 @@ models:
       RI_P: false
 
     dynamic_params:
-      alpha: [0.1]
+      # Asymmetric switching parameters.
+      #
+      # alpha: majority → minority switching factor.
+      # beta : minority → majority switching factor.
+      alpha: [0, 0.1, 0.2, 0.3, 0.4] # ['auto', 5]
       beta: [0.0]
+      
+      # Cost and rebalancing factors.
+      #
+      # Q_C    : Bayes decision cost ratio QC = (C10 - C00) / (C01 - C11).
+      # Q_RB_S : neutral / population rebalancing factor.
+      # Q_RB_C : classification-oriented rebalancing factor.
       Q_C: [1]
-      Q_RB_S: [1]
-      Q_RB_C: [1]
-      num_experts: [3]
+      Q_RB_S: [1] # ['auto', 5] # ['full'] # [1, 2, 4, 8]
+      Q_RB_C: [1] # ['auto', 5] # ['full'] # [1, 2, 4, 8]
+
+      # Ensemble structure.
+      num_experts: [11]

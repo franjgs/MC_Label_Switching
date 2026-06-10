@@ -38,12 +38,18 @@ from libraries.imbalance_degree import imbalance_degree
 # Suppress ConvergenceWarnings
 warnings.filterwarnings("ignore", category=ConvergenceWarning)
 
+DEFAULT_CONFIG_PATH = "config/config_smoke.yaml"
+
+# Transition note:
+# config_smoke.yaml is currently used as the validated structured
+# LSEnsemble configuration while config_train.yaml is migrated.
+
 parser = argparse.ArgumentParser(
     description="Optimize hyperparameters for binary-decomposition multiclass experiments."
 )
 parser.add_argument(
     "--config",
-    default="config/config_train.yaml",
+    default=DEFAULT_CONFIG_PATH,
     help="Path to the YAML configuration file."
 )
 args = parser.parse_args()
