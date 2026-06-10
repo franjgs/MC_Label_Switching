@@ -75,16 +75,8 @@ model_selection = config["simulation"]["model_selection"]
 model_list = config["models"]
 
 # COMMENTS FOR SAFE SELECTION:
-# - LogisticRegression: index 0 – Logistic regression with L2 regularization
-# - RandomForestClassifier: index 1 – Random forest with class_weight='balanced'
-# - LSEnsemble: index 2 – Asymmetric Label Switched Ensemble (ALSE) – OUR MAIN METHOD
-# - MLPClassifier: index 3 – Standard multilayer perceptron from scikit-learn
-# - LGBMClassifier: index 4 – LightGBM with is_unbalance=True
-# - kNN: index 5 – K-Nearest Neighbors
-# - C4.5: index 6 – Decision tree with entropy criterion (C4.5 approximation)
-# - SVM: index 7 – Support Vector Machine with RBF kernel
-# - MultiRandBal: index 8 – Ensemble with SMOTE oversampling + random undersampling
-# - LSEnsemble Calibrated: index 9 – ALSE Calibrated 
+# Current YAML models include RandomForestClassifier, LSEnsemble,
+# MLPClassifier, LGBMClassifier, kNN, and SVM.
 
 # Examples of selection (uncomment the desired line):
 
@@ -92,10 +84,9 @@ model_list = config["models"]
 # model_list = config["models"]
 
 # 2. Run only our main method (LSEnsemble / ALSE)
-# model_list = [config["models"][2]] # Only ALSE
+# model_list = [m for m in config["models"] if m["name"] == "LSEnsemble"] # Only ALSE
 
-# 3. Comparison between ALSE and classical baselines (example: RF + LightGBM + SVM + MLP)
-# model_list = [config["models"][i] for i in [1, 4, 7, 3]]
+# 3. Comparison between ALSE and classical baselines (example: RF + SVM + MLP)
 
 # 4. Run only baselines without ALSE (for ablation or clean comparison)
 # model_list = [config["models"][i] for i in [0, 1, 3, 4, 5, 6, 7, 8]]
@@ -103,9 +94,8 @@ model_list = config["models"]
 
 # Apply the desired selection here (uncomment only one option)
 # model_list = config["models"]  # All models
-model_list = [config["models"][i] for i in [1, 4, 7, 3]]
-model_list = [config["models"][2]] # Only ALSE
-
+# model_list = [m for m in config["models"] if m["name"] in {"RandomForestClassifier", "SVM", "MLPClassifier"}]
+model_list = [m for m in config["models"] if m["name"] == "LSEnsemble"] # Only ALSE
 
 # Generate Model Configurations
 CV_config = generate_model_configurations(model_list)
@@ -113,6 +103,8 @@ CV_config = generate_model_configurations(model_list)
 # Load Datasets
 dataset_special_cases = {}
 datasets = load_datasets(data_path, N_max, dataset_special_cases)
+
+Partial_saving = False
 
 # Process Datasets
 for dataset_name, (X, y, C0) in datasets.items():
@@ -174,6 +166,8 @@ for dataset_name, (X, y, C0) in datasets.items():
     best_metric_avg = dict()
     best_metric_peak = dict()
     best_model_peak = dict()
+    filename_o = dict()
+    partial_filename_o = dict()
     for model_item in model_list:
         model_name = model_item["name"]
         logger.info(f'Model: {model_name}')
@@ -185,7 +179,14 @@ for dataset_name, (X, y, C0) in datasets.items():
             RI_P_optimization = model_item['LSE_optimization']['RI_P']
 
             logger.info(f'    Switching: {int(SW_optimization)}, QC: {int(QC_optimization)}, Cost: {int(RI_C_optimization)}, Population: {int(RI_P_optimization)}')
-        
+            filename_o[model_name] = f"{dataset_name}_{ECOC_enc}_{model_name}_SW_{int(SW_optimization)}_QC_{int(QC_optimization)}_RIC_{int(RI_C_optimization)}_RIP_{int(RI_P_optimization)}_train.pkl"
+            if Partial_saving:
+                partial_filename_o[model_name] = f"{dataset_name}_{ECOC_enc}_{model_name}_SW_{int(SW_optimization)}_QC_{int(QC_optimization)}_RIC_{int(RI_C_optimization)}_RIP_{int(RI_P_optimization)}_partial_train.pkl"
+        else:
+            if Partial_saving:
+                partial_filename_o[model_name] = f"{dataset_name}_{ECOC_enc}_{model_name}_partial_train.pkl"
+            filename_o[model_name] = f"{dataset_name}_{ECOC_enc}_{model_name}_train.pkl"
+
         dynamic_combinations = model_item["dynamic_params"]
         n_conf_test = len(list(product(*model_item["dynamic_params"].values())))
 
@@ -313,8 +314,8 @@ for dataset_name, (X, y, C0) in datasets.items():
                                 alpha_start = estimate_alpha(QP_tr[j_dic])
                                 n_items = len(model_item['dynamic_params'].get('LS_alpha', []))
                                 if n_items > 0:
-                                    model_item['dynamic_params']['LS_alpha'] = np.round(np.linspace(max(0.0, alpha_start - 0.10),
-                                                                                                    min(0.45, alpha_start + 0.12), n_items), 3).tolist() 
+                                    model_item['dynamic_params']['LS_alpha'] = np.round(np.linspace(max(0.0, alpha_start - 0.1),
+                                                                                                    min(0.45, alpha_start + 0.2), n_items), 3).tolist() 
                                 
                         CV_config[model_name] = []  # Reset to avoid accumulating old configs
                         params = model_item['params']
@@ -358,7 +359,7 @@ for dataset_name, (X, y, C0) in datasets.items():
                         elif model_name == "LGBMClassifier":
                             # Create feature names for consistency (f0, f1, ...)
                             feature_names = [f'f{i}' for i in range(x_train.shape[1])]
-                            
+                             
                             # Convert training and validation/test sets to pandas DataFrame
                             x_train_df = pd.DataFrame(x_train, columns=feature_names)
                             x_test_df = pd.DataFrame(x_test, columns=feature_names)
@@ -392,15 +393,102 @@ for dataset_name, (X, y, C0) in datasets.items():
                         if metric > best_metric_peak[model_name][j_dic]:
                             best_metric_peak[model_name][j_dic] = metric
                             best_model_peak[model_name][j_dic] = [cv_config, metric, CM]
-                            if verbose and model_selection == "peak":
+                            if verbose: #  and model_selection == "peak":
                                 logger.info(f'  Model: {model_name}. Dichotomy: {j_dic+1}')
                                 logger.info(f'      Best configuration (peak): {cv_config}')
                                 logger.info(f'      Best metric (peak): {best_metric_peak[model_name][j_dic]:.5f}')
                                 logger.info('')
                         k_conf += 1
         
+        if Partial_saving:
+            # After processing ALL dichotomies for this simulation k_simu
+            # 1. Compute partial best configurations (avg and peak) up to this simulation
+            partial_best_model_avg = {}
+            partial_best_metric_avg = dict()
+            partial_best_metric_peak = dict()
+            partial_best_model_peak = dict()
+            
+            for model_item in model_list:
+                model_name = model_item["name"]
+                partial_best_metric_avg[model_name] = np.zeros(num_dichotomies)
+                partial_best_model_avg[model_name] = [dict() for j_dic in range(num_dichotomies)]
+                partial_best_metric_peak[model_name] = np.zeros(num_dichotomies)
+                partial_best_model_peak[model_name] = [dict() for j_dic in range(num_dichotomies)]
+                
+                for j_dic in range(num_dichotomies):
+                    k_conf = 0
+                    for cv_config in CV_config_full[model_name][j_dic]:
+                        # Average performance up to this simulation
+                        avg_metric_conf = np.mean(metric_conf[model_name][k_conf, j_dic, :, :k_simu+1])
+                        CM_avg = CM_accumulated[model_name][j_dic][k_conf] / ((num_folds * (k_simu+1)))
     
-    # Compute best_metric_avg (average performance)
+                        if model_selection == "avg":
+                            if avg_metric_conf > partial_best_metric_avg[model_name][j_dic]:
+                                partial_best_metric_avg[model_name][j_dic] = avg_metric_conf
+                                partial_best_model_avg[model_name][j_dic] = [cv_config, avg_metric_conf, CM_avg]
+    
+                        # Peak: update if this simulation has a better fold
+                        peak_metric = np.max(metric_conf[model_name][k_conf, j_dic, :, :k_simu+1])
+                        if peak_metric > partial_best_metric_peak[model_name][j_dic]:
+                            partial_best_metric_peak[model_name][j_dic] = peak_metric
+                            partial_best_model_peak[model_name][j_dic] = [cv_config, peak_metric, CM_avg]  # or take the best fold CM
+    
+                        k_conf += 1
+    
+            partial_best_model = dict()
+            partial_best_metric = dict()
+            # Best model selection logic
+            for model_item in model_list:
+                model_name = model_item["name"]
+                partial_best_model[model_name] = [dict() for j_dic in range(num_dichotomies)] #initialize
+                partial_best_metric[model_name] = [0 for j_dic in range(num_dichotomies)] #initialize
+            
+                for j_dic in range(num_dichotomies):
+                    if model_selection == "peak":
+                        # Select based on peak performance (partial_best_metric_peak)
+                        partial_best_model[model_name][j_dic] = partial_best_model_peak[model_name][j_dic]  # cv_config, metric, CM
+                        partial_best_metric[model_name][j_dic] = partial_best_metric_peak[model_name][j_dic]
+                    elif model_selection == "avg":
+                        # Select based on average performance (partial_best_metric_avg)
+                        partial_best_model[model_name][j_dic] = partial_best_model_avg[model_name][j_dic] # cv_config, metric, CM
+                        partial_best_metric[model_name][j_dic] = partial_best_metric_avg[model_name][j_dic]
+                    if verbose:
+                        logger.info(f'Model: {model_name}. Dichotomy: {j_dic+1}')
+                        logger.info(f'Partial Best configuration ({model_selection}): {partial_best_model[model_name][j_dic][0]}')  # cv_config
+                        logger.info(f'Partial Best metric ({model_selection}): {partial_best_model[model_name][j_dic][1]:.5f}')  # metric
+                        logger.info(f'Partial Best CM ({model_selection}): {partial_best_model[model_name][j_dic][2]}')  # CM
+                        logger.info('')
+                
+                # 3. Save partial results after each simulation
+                partial_result_data = {
+                    "dataset": dataset_name,
+                    'nclass': nclass,
+                    "class_labels": class_labels.tolist(),
+                    "ECOC_enc": ECOC_enc,
+                    "num_dichotomies": num_dichotomies,
+                    'flag_swap': flag_swap,
+                    "model_name": model_name,
+                    'n_simus_so_far': k_simu + 1,  # important to know how far it got
+                    'num_folds': num_folds,
+                    "Test_size": Test_size,
+                    'f_sel': metric_function_name,
+                   
+                    "best_config": partial_best_model[model_name],
+                    "binary_metrics": {
+                        "best_metric_peak": partial_best_metric_peak[model_name],
+                        "best_metric_avg": partial_best_metric_avg[model_name],
+                        "best_metric": partial_best_metric[model_name],
+                    },
+                }                
+                # Generate filename based on dataset and model
+                partial_file_path = os.path.join(output_path, partial_filename_o[model_name])
+        
+                with open(partial_file_path, 'wb') as f:
+                    pickle.dump(partial_result_data, f)
+        
+                logger.info(f"Partial results saved after simulation {k_simu+1}/{n_simus}: {partial_filename_o}")
+    
+    # Compute final best_metric_avg (average performance)
     for model_item in model_list:
         model_name = model_item["name"]
         for j_dic in range(num_dichotomies):
@@ -420,7 +508,7 @@ for dataset_name, (X, y, C0) in datasets.items():
     
     best_model = dict()
     best_metric = dict()
-    # Best model selection logic
+    # Final Best model selection logic
     for model_item in model_list:
         model_name = model_item["name"]
         best_model[model_name] = [dict() for j_dic in range(num_dichotomies)] #initialize
@@ -466,17 +554,7 @@ for dataset_name, (X, y, C0) in datasets.items():
         }
     
         # Generate filename based on dataset and model
-        if 'LSEnsemble' in model_name:
-            SW_optimization = model_item['LSE_optimization']['SW']
-            QC_optimization = model_item['LSE_optimization']['QC']
-            RI_C_optimization = model_item['LSE_optimization']['RI_C']
-            RI_P_optimization = model_item['LSE_optimization']['RI_P']
-    
-            filename_o = f"{dataset_name}_{ECOC_enc}_{model_name}_SW_{int(SW_optimization)}_QC_{int(QC_optimization)}_RIC_{int(RI_C_optimization)}_RIP_{int(RI_P_optimization)}_train.pkl"
-        else:
-            filename_o = f"{dataset_name}_{ECOC_enc}_{model_name}_train.pkl"
-    
-        file_path = os.path.join(output_path, filename_o)
+        file_path = os.path.join(output_path, filename_o[model_name])
     
         # Save the combined configuration and metrics using pickle
         with open(file_path, 'wb') as f:

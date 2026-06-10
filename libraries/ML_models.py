@@ -9,8 +9,10 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-import torch.optim as optim
+
 import torch.nn.functional as F
+
+import time
 import logging
 
 
@@ -33,221 +35,1399 @@ from scipy import special
 from libraries.functions import generate_batches, compute_imbalance_ratio
 from libraries.optimizers import LBFGSScipy, train_model, weighted_mse_loss
 
-# ---------------------------------------------
-# PyTorch implementation of a custom MLP
-# ---------------------------------------------
-class MLPClassifierTorch(nn.Module):
-    def __init__(self, input_dim, hidden_layer_sizes=(100,), activation='relu', 
-                 alpha=0.0, beta=0.0, alpha_tr=0.0001, batch_size='auto', 
-                 learning_rate_init=0.001, max_iter=200, optim='adam'):
-        super().__init__()
+from libraries.optimizers import LOSS_FUNCTIONS
 
-        self.hidden_layer_sizes = hidden_layer_sizes
-        self.activation = activation
+logger = logging.getLogger(__name__)
+
+TORCH_DTYPE = torch.float32
+NUMPY_DTYPE = np.float32
+eps=np.finfo(float).eps
+
+class TorchLSBase(nn.Module):
+    """
+    Common utilities for Torch-based learners used inside the Label Switching
+    ensemble framework.
+
+    This base class centralizes:
+    - dtype and device handling,
+    - NumPy to Torch conversion,
+    - loss-function resolution,
+    - optimizer construction,
+    - common prediction helpers.
+
+    Child classes are expected to implement `forward()`.
+    """
+
+    def __init__(self, alpha=0.0, beta=0.0, dtype=TORCH_DTYPE):
+        super().__init__()
         self.alpha = alpha
         self.beta = beta
+        self.model_dtype = dtype
+
+    def _get_first_param(self):
+        """
+        Return the first trainable parameter, or None if the module has no parameters.
+        """
+        return next(self.parameters(), None)
+
+    def _get_model_device(self):
+        """
+        Return the device used by the model parameters.
+        """
+        first_param = self._get_first_param()
+        if first_param is None:
+            return torch.device("cpu")
+        return first_param.device
+
+    def _get_model_dtype(self):
+        """
+        Return the dtype used by the model parameters.
+        """
+        first_param = self._get_first_param()
+        if first_param is None:
+            return self.model_dtype
+        return first_param.dtype
+
+    def _to_tensor(self, x, allow_none=False):
+        """
+        Convert an input object to a Torch tensor aligned with model dtype and device.
+        """
+        if x is None:
+            if allow_none:
+                return None
+            raise TypeError("Input cannot be None.")
+
+        device = self._get_model_device()
+        model_dtype = self._get_model_dtype()
+
+        if isinstance(x, np.ndarray):
+            x_np = np.asarray(x).copy()
+            return torch.from_numpy(x_np).to(device=device, dtype=model_dtype)
+
+        if isinstance(x, torch.Tensor):
+            return x.to(device=device, dtype=model_dtype)
+
+        raise TypeError("Input must be torch.Tensor or np.ndarray.")
+
+    def _prepare_training_data(self, x_train, y_train, sample_weight=None):
+        """
+        Convert training inputs, targets, and optional sample weights to aligned tensors.
+        """
+        x_train = self._to_tensor(x_train)
+        y_train = self._to_tensor(y_train)
+
+        if sample_weight is None:
+            sample_weight = torch.ones_like(
+                y_train,
+                dtype=self._get_model_dtype(),
+                device=self._get_model_device()
+            )
+        else:
+            sample_weight = self._to_tensor(sample_weight)
+
+        return x_train, y_train, sample_weight
+
+    def _resolve_loss_fn(self, loss_fn):
+        """
+        Resolve the loss function from either a callable or a registered name.
+        """
+        if callable(loss_fn):
+            return loss_fn
+        return LOSS_FUNCTIONS.get(loss_fn, weighted_mse_loss)
+
+    def _build_lbfgs_optimizer(self, max_iter=150, max_eval=150):
+        """
+        Build the legacy SciPy-based L-BFGS optimizer.
+        """
+        return LBFGSScipy(
+            self.parameters(),
+            max_iter=max_iter,
+            max_eval=max_eval,
+            tolerance_grad=1e-04,
+            tolerance_change=10e6 * eps,
+            history_size=10
+        )
+
+    def _build_standard_optimizer(self, optim, learning_rate=None, weight_decay=0.0):
+        """
+        Build a standard first-order optimizer following the legacy defaults
+        used in the original codebase.
+        """
+        if optim == 'adam':
+            lr = 0.001 if learning_rate is None else learning_rate
+            return torch.optim.Adam(
+                self.parameters(),
+                lr=lr,
+                weight_decay=weight_decay
+            )
+
+        if optim == 'adamw':
+            lr = 0.001 if learning_rate is None else learning_rate
+            return torch.optim.AdamW(
+                self.parameters(),
+                lr=lr,
+                weight_decay=weight_decay
+            )
+
+        if optim == 'rmsprop':
+            lr = 0.003 if learning_rate is None else learning_rate
+            return torch.optim.RMSprop(self.parameters(), lr=lr)
+
+        if optim == 'sgd':
+            lr = 0.1 if learning_rate is None else learning_rate
+            return torch.optim.SGD(self.parameters(), lr=lr, momentum=0.9)
+
+        if optim == 'adagrad':
+            lr = 0.01 if learning_rate is None else learning_rate
+            return torch.optim.Adagrad(self.parameters(), lr=lr)
+
+        if optim == 'adadelta':
+            lr = 0.01 if learning_rate is None else learning_rate
+            return torch.optim.Adadelta(self.parameters(), lr=lr)
+
+        raise ValueError(f"Unsupported optimizer: {optim}")
+
+    def predict(self, x):
+        """
+        Return the continuous compressed output.
+        """
+        self.eval()
+        x = self._to_tensor(x)
+
+        with torch.no_grad():
+            outputs = self.forward(x)
+
+        return outputs.detach().cpu().numpy().reshape(-1)
+
+    def predict_proba(self, x):
+        """
+        Map the compressed output from [-1, 1] into [0, 1].
+        """
+        self.eval()
+        x = self._to_tensor(x)
+
+        with torch.no_grad():
+            outputs = self.forward(x)
+            prob_pos = torch.clamp((outputs + 1.0) / 2.0, 0.0, 1.0)
+            prob_neg = 1.0 - prob_pos
+
+        return torch.cat([prob_neg, prob_pos], dim=1).cpu().numpy()
+
+
+class ActivationMixin:
+    """
+    Common utilities for callable hidden activation functions.
+    """
+
+    VALID_ACTIVATIONS = {torch.relu, torch.tanh, torch.sigmoid}
+
+    def _validate_activation_fn(self, activation_fn):
+        """
+        Validate that the activation function is one of the supported callables.
+        """
+        if activation_fn not in self.VALID_ACTIVATIONS:
+            valid_names = sorted(fn.__name__ for fn in self.VALID_ACTIVATIONS)
+            raise ValueError(
+                f"Unsupported activation function "
+                f"'{getattr(activation_fn, '__name__', activation_fn)}'. "
+                f"Supported activations: {valid_names}."
+            )
+
+    def _apply_hidden_activation(self, x):
+        """
+        Apply the configured callable hidden activation.
+        """
+        return self.activation_fn(x)
+
+
+class AsymmetricOutputMixin:
+    """
+    Shared asymmetric output compression for LS-compatible Torch models.
+    """
+
+    def _apply_asymmetric_output(self, z, output_act=1):
+        """
+        Apply the asymmetric compressed output transformation.
+        """
+        if output_act == 1:
+            return torch.where(
+                z < 0,
+                torch.tanh(z) * (1 - 2 * self.alpha),
+                torch.tanh(z) * (1 - 2 * self.beta),
+            )
+
+        if output_act == 2:
+            return torch.where(
+                z < 0,
+                torch.tanh(z / (1 - 2 * self.alpha)) * (1 - 2 * self.alpha),
+                torch.tanh(z / (1 - 2 * self.beta)) * (1 - 2 * self.beta),
+            )
+
+        raise ValueError("Invalid output_act. Choose 1 or 2.")
+
+
+class LegacyLinearInitMixin:
+    """
+    Initialization helpers that reproduce the legacy behavior of the original code.
+    """
+
+    def _init_linear_weights_xavier_keep_bias(self):
+        """
+        Apply Xavier uniform initialization to all linear weights while preserving
+        the default PyTorch bias initialization.
+        """
+        def weight_init(module):
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+
+        self.apply(weight_init)
+
+    def _init_linear_weights_xavier_zero_bias(self, layers):
+        """
+        Apply Xavier uniform initialization to linear weights and set all biases
+        to zero. This reproduces the original deep MLP implementation.
+        """
+        for layer in layers:
+            nn.init.xavier_uniform_(layer.weight)
+            nn.init.zeros_(layer.bias)
+
+
+class LogisticRegressionTorch(TorchLSBase, AsymmetricOutputMixin, LegacyLinearInitMixin):
+    """
+    Flexible linear expert for LSEnsemble.
+
+    This class is the linear counterpart of AsymmetricMLP. It keeps the same
+    training interface and optimization modes, while allowing both:
+
+    1. Legacy LSE/ALSE behavior:
+       - Linear layer followed by asymmetric compressed tanh output.
+       - Typical loss: weighted_mse_loss.
+       - Targets usually encoded as {-1, +1}, possibly after label switching.
+
+    2. sklearn-like logistic regression behavior:
+       - Linear logits during training.
+       - BCEWithLogits loss.
+       - Targets internally converted to {0, 1}.
+       - Optional class_weight="balanced".
+       - Optional L2 regularization controlled by C.
+       - Optional asymmetric compressed output outside fit() for LSEnsemble.
+
+    Optimization modes
+    ------------------
+    - optim="lbfgs":
+      Full-batch LBFGS training using the project legacy LBFGSScipy wrapper.
+
+    - optim="warm_start_lbfgs":
+      Minibatch warm-start with a standard optimizer followed by full-batch
+      LBFGS refinement.
+
+    - optim in {"adam", "adamw", "rmsprop", "sgd", "adagrad", "adadelta"}:
+      Minibatch training with the corresponding Torch optimizer.
+    """
+
+    def __init__(
+        self,
+        input_dim,
+        alpha,
+        beta,
+        loss_fn=weighted_mse_loss,
+        optim="lbfgs",
+        max_iter=None,
+        learning_rate=None,
+        mode="random",
+        batch_size=None,
+        dtype=TORCH_DTYPE,
+        output_act=1,
+        n_epoch=50,
+        n_batch=256,
+        output_mode="asymmetric_tanh",
+        train_output_mode=None,
+        eval_output_mode=None,
+        C=None,
+        penalty="l2",
+        class_weight=None,
+        weight_decay=0.0,
+        debug=False,
+        early_stopping=True,
+        es_patience=10,
+        es_tol=1e-4,
+        lbfgs_max_iter=150,
+        lbfgs_max_eval=150,
+        warm_start=None,
+        warm_start_optim="rmsprop",
+        warm_start_n_epoch=300,
+        warm_start_learning_rate=0.003,
+        warm_start_weight_decay=0.0,
+        warm_start_debug=None,
+        random_state=None
+    ):
+        """
+        Initialize the flexible linear expert.
+
+        Parameters
+        ----------
+        input_dim : int
+            Number of input features.
+
+        alpha : float
+            Label switching factor from majority to minority class.
+
+        beta : float
+            Label switching factor from minority to majority class.
+
+        loss_fn : callable or str
+            Loss function. Use "MSE" for legacy LSE behavior and
+            "BCE_logit" for sklearn-like logistic regression.
+
+        output_mode : str
+            Default output mode. Used as fallback for train/eval modes.
+
+        train_output_mode : str or None
+            Output mode used during fit(). If None, it is inferred:
+            - "logits" for BCE_logit.
+            - output_mode otherwise.
+
+        eval_output_mode : str or None
+            Output mode used outside fit(). If None, output_mode is used.
+
+        C : float or None
+            Inverse L2 regularization strength, sklearn-style.
+
+        class_weight : dict, "balanced" or None
+            Optional class weighting. class_weight="balanced" follows the
+            sklearn convention.
+        """
+        super().__init__(alpha=alpha, beta=beta, dtype=dtype)
+
+        if random_state is not None:
+            np.random.seed(random_state)
+            torch.manual_seed(random_state)
+
+        # Backward compatibility with the previous constructor.
+        if max_iter is not None:
+            n_epoch = max_iter
+        if batch_size is not None:
+            n_batch = batch_size
+
+        self.input_dim = input_dim
+        self.output_act = output_act
+
+        self.n_epoch = n_epoch
+        self.n_batch = n_batch
+        self.optim = optim
+        self.mode = mode
+        self.loss_fn = loss_fn
+        self.learning_rate = learning_rate
+        self.weight_decay = weight_decay
+        self.debug = debug
+
+        self.early_stopping = early_stopping
+        self.es_patience = es_patience
+        self.es_tol = es_tol
+
+        self.lbfgs_max_iter = lbfgs_max_iter
+        self.lbfgs_max_eval = lbfgs_max_eval
+
+        self.output_mode = output_mode
+
+        self.train_output_mode = train_output_mode
+        self.eval_output_mode = eval_output_mode
+
+        if self.train_output_mode is None:
+            if self._is_bce_logit_loss(loss_fn):
+                self.train_output_mode = "logits"
+            else:
+                self.train_output_mode = output_mode
+
+        if self.eval_output_mode is None:
+            self.eval_output_mode = output_mode
+
+        self._fit_in_progress = False
+
+        self.C = C
+        self.penalty = penalty
+        self.class_weight = class_weight
+
+        warm_start = {} if warm_start is None else dict(warm_start)
+
+        self.warm_start_optim = warm_start.get("optim", warm_start_optim)
+        self.warm_start_n_epoch = warm_start.get("n_epoch", warm_start_n_epoch)
+        self.warm_start_learning_rate = warm_start.get(
+            "learning_rate",
+            warm_start_learning_rate
+        )
+        self.warm_start_weight_decay = warm_start.get(
+            "weight_decay",
+            warm_start_weight_decay
+        )
+        self.warm_start_debug = warm_start.get("debug", warm_start_debug)
+
+        self.linear = nn.Linear(input_dim, 1)
+        self._init_linear_weights_xavier_keep_bias()
+
+        self.model_dtype = dtype
+        self.to(self.model_dtype)
+
+        self._validate_configuration()
+
+    def _validate_configuration(self):
+        """
+        Validate configuration values.
+        """
+        valid_output_modes = {"asymmetric_tanh", "logits", "sigmoid"}
+
+        for name, value in {
+            "output_mode": self.output_mode,
+            "train_output_mode": self.train_output_mode,
+            "eval_output_mode": self.eval_output_mode,
+        }.items():
+            if value not in valid_output_modes:
+                raise ValueError(
+                    f"Invalid {name}='{value}'. "
+                    f"Available values: {sorted(valid_output_modes)}"
+                )
+
+        if self.penalty not in {None, "none", "l2"}:
+            raise ValueError(
+                "Only penalty=None, penalty='none' and penalty='l2' are supported."
+            )
+
+        if self.C is not None and self.C <= 0:
+            raise ValueError("C must be strictly positive when provided.")
+
+        if self._is_bce_logit_loss(self.loss_fn) and self.train_output_mode != "logits":
+            raise ValueError(
+                "loss_fn='BCE_logit' requires train_output_mode='logits'. "
+                "BCEWithLogits must receive raw logits during training."
+            )
+
+    def _is_bce_logit_loss(self, loss_fn):
+        """
+        Return True when the selected loss is BCE with logits.
+        """
+        if isinstance(loss_fn, str):
+            return loss_fn.lower() in {
+                "bce_logit",
+                "bce_logits",
+                "bcewithlogits",
+                "bcewithlogitsloss"
+            }
+
+        return False
+
+    def _resolve_logreg_loss_fn(self, loss_fn):
+        """
+        Resolve the effective loss function for this linear expert.
+
+        BCE_logit is handled inside this class because it needs:
+        - target conversion from {-1, +1} to {0, 1},
+        - optional class_weight,
+        - optional C-based L2 regularization.
+        """
+        if self._is_bce_logit_loss(loss_fn):
+            return self._bce_logit_loss_with_options
+
+        resolved = self._resolve_loss_fn(loss_fn)
+
+        if self.C is not None and self.penalty not in {None, "none"}:
+            return self._wrap_loss_with_l2(resolved)
+
+        return resolved
+
+    def _targets_to_zero_one(self, target):
+        """
+        Convert binary targets from {-1, +1} or {0, 1} to {0, 1}.
+        """
+        return torch.where(
+            target > 0,
+            torch.ones_like(target),
+            torch.zeros_like(target)
+        )
+
+    def _class_weight_tensor(self, target_01):
+        """
+        Build a per-sample class-weight tensor.
+
+        For class_weight="balanced", the sklearn convention is used:
+
+            n_samples / (n_classes * n_samples_class)
+        """
+        if self.class_weight is None:
+            return torch.ones_like(target_01)
+
+        class_weight = self.class_weight
+
+        if isinstance(class_weight, str):
+            class_weight = class_weight.strip().lower()
+
+        if class_weight == "balanced":
+            target_flat = target_01.view(-1)
+
+            n_samples = target_flat.numel()
+            n_pos = torch.sum(target_flat == 1)
+            n_neg = torch.sum(target_flat == 0)
+
+            if n_pos == 0 or n_neg == 0:
+                return torch.ones_like(target_01)
+
+            w_pos = n_samples / (2.0 * n_pos)
+            w_neg = n_samples / (2.0 * n_neg)
+
+            weights = torch.where(
+                target_flat == 1,
+                w_pos,
+                w_neg
+            ).view(-1, 1)
+
+            return weights.to(
+                device=target_01.device,
+                dtype=target_01.dtype
+            )
+
+        if isinstance(class_weight, dict):
+            w0 = float(class_weight.get(0, class_weight.get(-1, 1.0)))
+            w1 = float(class_weight.get(1, 1.0))
+
+            return torch.where(
+                target_01 > 0,
+                torch.full_like(target_01, w1),
+                torch.full_like(target_01, w0)
+            )
+
+        raise ValueError(f"Unsupported class_weight={self.class_weight}")
+
+    def _l2_penalty(self, normalizer=None):
+        """
+        Compute sklearn-like L2 penalty controlled by C.
+
+        The intercept is intentionally not regularized.
+
+        Important
+        ---------
+        When the data loss is normalized by the sum of effective sample
+        weights, the L2 term is normalized by the same quantity. This avoids
+        over-regularizing when C is small.
+        """
+        zero = torch.zeros(
+            (),
+            device=self.linear.weight.device,
+            dtype=self.linear.weight.dtype
+        )
+
+        if self.C is None:
+            return zero
+
+        if self.penalty in {None, "none"}:
+            return zero
+
+        if self.penalty != "l2":
+            raise ValueError(f"Unsupported penalty={self.penalty}")
+
+        if normalizer is None:
+            normalizer = torch.tensor(
+                1.0,
+                device=self.linear.weight.device,
+                dtype=self.linear.weight.dtype
+            )
+
+        normalizer = torch.clamp(normalizer, min=1.0)
+
+        return 0.5 * torch.sum(self.linear.weight ** 2) / (
+            float(self.C) * normalizer
+        )
+
+    def _bce_logit_loss_with_options(self, inputs, target, weights=None):
+        """
+        Compute BCEWithLogits loss with optional class weights and L2.
+
+        Effective weights follow sklearn's convention:
+
+            effective_weight[i] = sample_weight[i] * class_weight[y_i]
+
+        This method never modifies the input weights tensor.
+        """
+        target_01 = self._targets_to_zero_one(target)
+
+        if weights is None:
+            weights_ext = torch.ones_like(target_01)
+        else:
+            weights_ext = weights.to(
+                device=target_01.device,
+                dtype=target_01.dtype
+            ).view(-1, 1).clone()
+
+        class_weights = self._class_weight_tensor(target_01)
+        weights_eff = weights_ext * class_weights
+
+        normalizer = torch.clamp(weights_eff.sum(), min=1.0)
+
+        data_loss = F.binary_cross_entropy_with_logits(
+            inputs,
+            target_01,
+            weight=weights_eff,
+            reduction="sum"
+        )
+
+        data_loss = data_loss / normalizer
+        l2_loss = self._l2_penalty(normalizer=normalizer)
+
+        return data_loss + l2_loss
+
+    def _wrap_loss_with_l2(self, base_loss_fn):
+        """
+        Add optional C-based L2 regularization to a legacy/custom loss.
+
+        For legacy losses, the normalizer is estimated from the provided
+        sample weights.
+        """
+        def wrapped_loss(outputs, labels, weights=None):
+            """
+            Compute wrapped loss plus normalized L2 penalty.
+            """
+            data_loss = base_loss_fn(outputs, labels, weights)
+
+            if hasattr(data_loss, "ndim") and data_loss.ndim > 0:
+                data_loss = torch.mean(data_loss)
+
+            if weights is None:
+                normalizer = torch.tensor(
+                    float(labels.numel()),
+                    device=outputs.device,
+                    dtype=outputs.dtype
+                )
+            else:
+                weights_ext = weights.to(
+                    device=outputs.device,
+                    dtype=outputs.dtype
+                ).view(-1, 1).clone()
+
+                normalizer = torch.clamp(weights_ext.sum(), min=1.0)
+
+            return data_loss + self._l2_penalty(normalizer=normalizer)
+
+        return wrapped_loss
+
+    def forward(self, x):
+        """
+        Run the forward pass through the linear layer.
+
+        During fit(), train_output_mode is used. Outside fit(),
+        eval_output_mode is used.
+
+        Returns
+        -------
+        torch.Tensor
+            Output according to the active output mode:
+            - "logits": raw linear logits.
+            - "sigmoid": sigmoid(logits).
+            - "asymmetric_tanh": asymmetric compressed tanh output.
+        """
+        x = x.to(
+            device=self.linear.weight.device,
+            dtype=self.linear.weight.dtype
+        )
+
+        z = self.linear(x)
+
+        if getattr(self, "_fit_in_progress", False):
+            active_output_mode = self.train_output_mode
+        else:
+            active_output_mode = self.eval_output_mode
+
+        if active_output_mode == "logits":
+            return z
+
+        if active_output_mode == "sigmoid":
+            return torch.sigmoid(z)
+
+        if active_output_mode == "asymmetric_tanh":
+            return self._apply_asymmetric_output(
+                z,
+                output_act=self.output_act
+            )
+
+        raise ValueError(f"Unsupported output mode: {active_output_mode}")
+
+    def _fit_with_standard_optimizer(
+        self,
+        x_train,
+        y_train,
+        sample_weight,
+        loss_fn,
+        optim,
+        n_epoch,
+        n_batch,
+        mode,
+        learning_rate,
+        weight_decay,
+        debug,
+        loss_already_normalized=False
+    ):
+        """
+        Train the model with a standard first-order optimizer.
+        """
+        optimizer = self._build_standard_optimizer(
+            optim,
+            learning_rate=learning_rate,
+            weight_decay=weight_decay
+        )
+
+        train_model(
+            x_train,
+            y_train,
+            self,
+            loss_fn,
+            optimizer,
+            sample_weight,
+            num_epochs=n_epoch,
+            batch_size=n_batch,
+            mode=mode,
+            lbfgs=False,
+            debug=debug,
+            early_stopping=self.early_stopping,
+            es_patience=self.es_patience,
+            es_tol=self.es_tol,
+            normalize_monitor_loss=not loss_already_normalized
+        )
+
+    def _fit_with_lbfgs(
+        self,
+        x_train,
+        y_train,
+        sample_weight,
+        loss_fn,
+        n_epoch,
+        mode,
+        debug,
+        loss_already_normalized=False
+    ):
+        """
+        Train the model with full-batch LBFGS.
+
+        This uses TorchLSBase._build_lbfgs_optimizer, preserving the legacy
+        LBFGSScipy configuration used by the project.
+        """
+        optimizer = self._build_lbfgs_optimizer(
+            max_iter=self.lbfgs_max_iter,
+            max_eval=self.lbfgs_max_eval
+        )
+
+        train_model(
+            x_train,
+            y_train,
+            self,
+            loss_fn,
+            optimizer,
+            sample_weight,
+            num_epochs=n_epoch,
+            batch_size=None,
+            mode=mode,
+            lbfgs=True,
+            debug=debug,
+            early_stopping=self.early_stopping,
+            es_patience=self.es_patience,
+            es_tol=self.es_tol,
+            normalize_monitor_loss=not loss_already_normalized
+        )
+
+    def fit(
+        self,
+        x_train,
+        y_train,
+        sample_weight=None,
+        n_epoch=None,
+        n_batch=None,
+        optim=None,
+        mode=None,
+        loss_fn=None,
+        debug=None
+    ):
+        """
+        Fit the flexible linear expert.
+
+        If n_epoch, n_batch, optim, mode, loss_fn or debug are not provided,
+        the values stored in the expert are used.
+        """
+        x_train, y_train, sample_weight = self._prepare_training_data(
+            x_train,
+            y_train,
+            sample_weight
+        )
+
+        # Avoid accidental in-place contamination of sample weights during
+        # repeated LBFGS closure calls or interactive debugging sessions.
+        sample_weight = sample_weight.clone().detach()
+
+        effective_n_epoch = self.n_epoch if n_epoch is None else n_epoch
+        effective_n_batch = self.n_batch if n_batch is None else n_batch
+        effective_optim = self.optim if optim is None else optim
+        effective_mode = self.mode if mode is None else mode
+        effective_loss_fn = self.loss_fn if loss_fn is None else loss_fn
+        effective_debug = self.debug if debug is None else debug
+
+        loss_already_normalized = self._is_bce_logit_loss(effective_loss_fn)
+        resolved_loss_fn = self._resolve_logreg_loss_fn(effective_loss_fn)
+
+        if sample_weight.max() > 10:
+            logger.warning(
+                "Unexpected large external sample_weight before LogReg training | "
+                "min=%.6f | max=%.6f | mean=%.6f. "
+                "This may indicate that class weights were already applied upstream.",
+                float(sample_weight.min().detach().cpu().item()),
+                float(sample_weight.max().detach().cpu().item()),
+                float(sample_weight.mean().detach().cpu().item())
+            )
+
+        self._fit_in_progress = True
+
+        try:
+            if effective_optim == "lbfgs":
+                lbfgs_t0 = time.perf_counter()
+
+                self._fit_with_lbfgs(
+                    x_train=x_train,
+                    y_train=y_train,
+                    sample_weight=sample_weight,
+                    loss_fn=resolved_loss_fn,
+                    n_epoch=effective_n_epoch,
+                    mode=effective_mode,
+                    debug=effective_debug,
+                    loss_already_normalized=loss_already_normalized
+                )
+
+                lbfgs_seconds = time.perf_counter() - lbfgs_t0
+                logger.debug("LBFGS timing | lbfgs=%.2fs", lbfgs_seconds)
+
+            elif effective_optim == "warm_start_lbfgs":
+                warm_debug = (
+                    effective_debug
+                    if self.warm_start_debug is None
+                    else self.warm_start_debug
+                )
+
+                warm_start_t0 = time.perf_counter()
+
+                self._fit_with_standard_optimizer(
+                    x_train=x_train,
+                    y_train=y_train,
+                    sample_weight=sample_weight,
+                    loss_fn=resolved_loss_fn,
+                    optim=self.warm_start_optim,
+                    n_epoch=self.warm_start_n_epoch,
+                    n_batch=effective_n_batch,
+                    mode=effective_mode,
+                    learning_rate=self.warm_start_learning_rate,
+                    weight_decay=self.warm_start_weight_decay,
+                    debug=warm_debug,
+                    loss_already_normalized=loss_already_normalized
+                )
+
+                warm_start_seconds = time.perf_counter() - warm_start_t0
+
+                lbfgs_t0 = time.perf_counter()
+
+                self._fit_with_lbfgs(
+                    x_train=x_train,
+                    y_train=y_train,
+                    sample_weight=sample_weight,
+                    loss_fn=resolved_loss_fn,
+                    n_epoch=effective_n_epoch,
+                    mode=effective_mode,
+                    debug=effective_debug,
+                    loss_already_normalized=loss_already_normalized
+                )
+
+                lbfgs_seconds = time.perf_counter() - lbfgs_t0
+                total_seconds = warm_start_seconds + lbfgs_seconds
+
+                logger.debug(
+                    "Warm-start LBFGS timing | warm_start=%.2fs | lbfgs=%.2fs | total=%.2fs",
+                    warm_start_seconds,
+                    lbfgs_seconds,
+                    total_seconds
+                )
+
+            else:
+                std_opt_t0 = time.perf_counter()
+
+                self._fit_with_standard_optimizer(
+                    x_train=x_train,
+                    y_train=y_train,
+                    sample_weight=sample_weight,
+                    loss_fn=resolved_loss_fn,
+                    optim=effective_optim,
+                    n_epoch=effective_n_epoch,
+                    n_batch=effective_n_batch,
+                    mode=effective_mode,
+                    learning_rate=self.learning_rate,
+                    weight_decay=self.weight_decay,
+                    debug=effective_debug,
+                    loss_already_normalized=loss_already_normalized
+                )
+
+                std_opt_seconds = time.perf_counter() - std_opt_t0
+                logger.debug("Standard Optimizer timing | std_opt=%.2fs", std_opt_seconds)
+
+        finally:
+            self._fit_in_progress = False
+
+        return self
+
+
+class AsymmetricMLP(TorchLSBase, ActivationMixin, AsymmetricOutputMixin, LegacyLinearInitMixin):
+    """
+    Legacy shallow asymmetric MLP with exactly one hidden layer.
+    """
+
+    def __init__(
+        self,
+        input_size,
+        hidden_size,
+        alpha,
+        beta,
+        dropout_prob=0.0,
+        activation_fn=torch.tanh,
+        output_act=1,
+        dtype=TORCH_DTYPE,
+        n_epoch=50,
+        n_batch=256,
+        optim="lbfgs",
+        mode="random",
+        loss_fn=weighted_mse_loss,
+        learning_rate=None,
+        weight_decay=0.0,
+        debug=False,
+        early_stopping=True,
+        es_patience=10,
+        es_tol=1e-4,
+        lbfgs_max_iter=150,
+        lbfgs_max_eval=150,
+        warm_start=None,
+        warm_start_optim="rmsprop",
+        warm_start_n_epoch=300,
+        warm_start_learning_rate=0.003,
+        warm_start_weight_decay=0.0,
+        warm_start_debug=None
+    ):
+        """
+        Initialize a shallow asymmetric MLP expert.
+
+        Training parameters are stored in the expert so that LSEnsemble can
+        configure all learners through a common interface.
+
+        Optimization modes
+        ------------------
+        - optim="lbfgs":
+          Full-batch LBFGS training. n_batch and mode are ignored.
+
+        - optim in {"adam", "adamw", "rmsprop", "sgd"}:
+          Minibatch training. n_batch and mode are used.
+
+        - optim="warm_start_lbfgs":
+          First minibatch training using n_batch and mode, then full-batch
+          LBFGS refinement without reinitializing the weights.
+
+        The optional warm_start dictionary can override the warm-start optimizer,
+        number of epochs, learning rate, weight decay and debug flag.
+        """
+        super().__init__(alpha=alpha, beta=beta, dtype=dtype)
+
+        self.hidden_size = hidden_size
+        self.activation_fn = activation_fn
+        self.output_act = output_act
+        self.dropout_prob = dropout_prob
+
+        self.n_epoch = n_epoch
+        self.n_batch = n_batch
+        self.optim = optim
+        self.mode = mode
+        self.loss_fn = loss_fn
+        self.learning_rate = learning_rate
+        self.weight_decay = weight_decay
+        self.debug = debug
+
+        self.early_stopping = early_stopping
+        self.es_patience = es_patience
+        self.es_tol = es_tol
+
+        self.lbfgs_max_iter = lbfgs_max_iter
+        self.lbfgs_max_eval = lbfgs_max_eval
+
+        # Warm-start configuration.
+        # Supports both the new nested YAML block `warm_start` and the older
+        # flat keyword arguments for backward compatibility.
+        warm_start = {} if warm_start is None else dict(warm_start)
+
+        self.warm_start_optim = warm_start.get("optim", warm_start_optim)
+        self.warm_start_n_epoch = warm_start.get("n_epoch", warm_start_n_epoch)
+        self.warm_start_learning_rate = warm_start.get(
+            "learning_rate",
+            warm_start_learning_rate
+        )
+        self.warm_start_weight_decay = warm_start.get(
+            "weight_decay",
+            warm_start_weight_decay
+        )
+        self.warm_start_debug = warm_start.get("debug", warm_start_debug)
+
+        self._validate_activation_fn(self.activation_fn)
+
+        self.hidden0 = nn.Sequential(
+            nn.Linear(input_size, hidden_size)
+        )
+        self.out = nn.Sequential(
+            nn.Linear(hidden_size, 1)
+        )
+        self.dropout = nn.Dropout(dropout_prob)
+
+        self._init_linear_weights_xavier_keep_bias()
+
+        self.model_dtype = dtype
+        self.to(self.model_dtype)
+
+    def forward(self, x):
+        """
+        Run the forward pass through one hidden layer and asymmetric output.
+        """
+        x = x.to(
+            device=self.hidden0[0].weight.device,
+            dtype=self.hidden0[0].weight.dtype
+        )
+
+        o = self.activation_fn(self.hidden0(x))
+        o = self.dropout(o)
+        z = self.out(o)
+
+        return self._apply_asymmetric_output(z, output_act=self.output_act)
+
+    def _fit_with_standard_optimizer(
+        self,
+        x_train,
+        y_train,
+        sample_weight,
+        loss_fn,
+        optim,
+        n_epoch,
+        n_batch,
+        mode,
+        learning_rate,
+        weight_decay,
+        debug
+    ):
+        """
+        Train the model with a standard first-order optimizer.
+
+        This helper is used both for direct minibatch training and for the
+        warm-start phase before LBFGS.
+        """
+        optimizer = self._build_standard_optimizer(
+            optim,
+            learning_rate=learning_rate,
+            weight_decay=weight_decay
+        )
+
+        train_model(
+            x_train,
+            y_train,
+            self,
+            loss_fn,
+            optimizer,
+            sample_weight,
+            num_epochs=n_epoch,
+            batch_size=n_batch,
+            mode=mode,
+            lbfgs=False,
+            debug=debug,
+            early_stopping=self.early_stopping,
+            es_patience=self.es_patience,
+            es_tol=self.es_tol
+        )
+
+    def _fit_with_lbfgs(
+        self,
+        x_train,
+        y_train,
+        sample_weight,
+        loss_fn,
+        n_epoch,
+        mode,
+        debug
+    ):
+        """
+        Train the model with full-batch LBFGS.
+
+        The current model weights are used as starting point, so this method can
+        be called after a previous optimizer to perform warm-start fine-tuning.
+        """
+        optimizer = self._build_lbfgs_optimizer(
+            max_iter=self.lbfgs_max_iter,
+            max_eval=self.lbfgs_max_eval
+        )
+
+        train_model(
+            x_train,
+            y_train,
+            self,
+            loss_fn,
+            optimizer,
+            sample_weight,
+            num_epochs=n_epoch,
+            batch_size=None,
+            mode=mode,
+            lbfgs=True,
+            debug=debug,
+            early_stopping=self.early_stopping,
+            es_patience=self.es_patience,
+            es_tol=self.es_tol
+        )
+
+    def fit(
+        self,
+        x_train,
+        y_train,
+        sample_weight=None,
+        n_epoch=None,
+        n_batch=None,
+        optim=None,
+        mode=None,
+        loss_fn=None,
+        debug=None
+    ):
+        """
+        Fit the shallow asymmetric MLP.
+
+        If n_epoch, n_batch, optim, mode, loss_fn or debug are not provided
+        explicitly, the values stored in the expert are used. This allows
+        LSEnsemble to configure all experts through a common interface.
+
+        Supported optimization modes
+        ----------------------------
+        - 'lbfgs':
+          Full-batch LBFGS. n_batch is ignored.
+
+        - 'warm_start_lbfgs':
+          Minibatch warm-start followed by full-batch LBFGS refinement.
+          The warm-start phase uses n_batch and mode. The LBFGS phase ignores
+          n_batch.
+
+        - any standard optimizer name:
+          Minibatch training. n_batch and mode are used.
+        """
+        x_train, y_train, sample_weight = self._prepare_training_data(
+            x_train,
+            y_train,
+            sample_weight
+        )
+
+        effective_n_epoch = self.n_epoch if n_epoch is None else n_epoch
+        effective_n_batch = self.n_batch if n_batch is None else n_batch
+        effective_optim = self.optim if optim is None else optim
+        effective_mode = self.mode if mode is None else mode
+        effective_loss_fn = self.loss_fn if loss_fn is None else loss_fn
+        effective_debug = self.debug if debug is None else debug
+
+        resolved_loss_fn = self._resolve_loss_fn(effective_loss_fn)
+
+        if effective_optim == "lbfgs":
+            lbfgs_t0 = time.perf_counter()
+            self._fit_with_lbfgs(
+                x_train=x_train,
+                y_train=y_train,
+                sample_weight=sample_weight,
+                loss_fn=resolved_loss_fn,
+                n_epoch=effective_n_epoch,
+                mode=effective_mode,
+                debug=effective_debug
+            )
+            lbfgs_seconds = time.perf_counter() - lbfgs_t0
+            logger.debug("LBFGS timing | lbfgs=%.2fs", lbfgs_seconds)
+
+        elif effective_optim == "warm_start_lbfgs":
+            # First phase: minibatch optimizer using n_batch and mode.
+            # Second phase: full-batch LBFGS refinement without reinitialization.
+            # LBFGS ignores n_batch by construction.
+            warm_debug = (
+                effective_debug
+                if self.warm_start_debug is None
+                else self.warm_start_debug
+            )
+
+            warm_start_t0 = time.perf_counter()
+
+            self._fit_with_standard_optimizer(
+                x_train=x_train,
+                y_train=y_train,
+                sample_weight=sample_weight,
+                loss_fn=resolved_loss_fn,
+                optim=self.warm_start_optim,
+                n_epoch=self.warm_start_n_epoch,
+                n_batch=effective_n_batch,
+                mode=effective_mode,
+                learning_rate=self.warm_start_learning_rate,
+                weight_decay=self.warm_start_weight_decay,
+                debug=warm_debug
+            )
+
+            warm_start_seconds = time.perf_counter() - warm_start_t0
+
+            lbfgs_t0 = time.perf_counter()
+
+            self._fit_with_lbfgs(
+                x_train=x_train,
+                y_train=y_train,
+                sample_weight=sample_weight,
+                loss_fn=resolved_loss_fn,
+                n_epoch=effective_n_epoch,
+                mode=effective_mode,
+                debug=effective_debug
+            )
+
+            lbfgs_seconds = time.perf_counter() - lbfgs_t0
+            total_seconds = warm_start_seconds + lbfgs_seconds
+
+            logger.debug(
+                "Warm-start LBFGS timing | warm_start=%.2fs | lbfgs=%.2fs | total=%.2fs",
+                warm_start_seconds,
+                lbfgs_seconds,
+                total_seconds
+            )
+
+        else:
+            std_opt_t0 = time.perf_counter()
+            self._fit_with_standard_optimizer(
+                x_train=x_train,
+                y_train=y_train,
+                sample_weight=sample_weight,
+                loss_fn=resolved_loss_fn,
+                optim=effective_optim,
+                n_epoch=effective_n_epoch,
+                n_batch=effective_n_batch,
+                mode=effective_mode,
+                learning_rate=self.learning_rate,
+                weight_decay=self.weight_decay,
+                debug=effective_debug
+            )
+            std_opt_seconds = time.perf_counter() - std_opt_t0
+            logger.debug( "Standard Optimizer timing | std_opt=%.2fs", std_opt_seconds)
+
+        return self
+
+class DeepAsymmetricMLP(TorchLSBase, ActivationMixin, AsymmetricOutputMixin, LegacyLinearInitMixin):
+    """
+    Deep asymmetric MLP with one or more hidden layers.
+
+    This class reproduces the original deep MLP behavior while using callable
+    activation functions.
+    """
+
+    def __init__(
+        self,
+        input_dim,
+        hidden_layer_sizes=(100,),
+        activation_fn=torch.relu,
+        alpha=0.0,
+        beta=0.0,
+        alpha_tr=0.0001,
+        batch_size='auto',
+        learning_rate_init=0.001,
+        max_iter=200,
+        optim='adam',
+        output_act=1,
+        dtype=TORCH_DTYPE
+    ):
+        super().__init__(alpha=alpha, beta=beta, dtype=dtype)
+
+        self.hidden_layer_sizes = tuple(hidden_layer_sizes)
+        self.activation_fn = activation_fn
         self.alpha_tr = alpha_tr
         self.batch_size = batch_size
         self.learning_rate_init = learning_rate_init
         self.max_iter = max_iter
         self.optim = optim
+        self.output_act = output_act
 
-        # Build layers
-        layer_sizes = [input_dim] + list(hidden_layer_sizes) + [1]
+        self._validate_activation_fn(self.activation_fn)
+
+        layer_sizes = [input_dim] + list(self.hidden_layer_sizes) + [1]
         self.layers = nn.ModuleList([
-            nn.Linear(layer_sizes[i], layer_sizes[i+1]) for i in range(len(layer_sizes)-1)
+            nn.Linear(layer_sizes[i], layer_sizes[i + 1]).to(dtype=dtype)
+            for i in range(len(layer_sizes) - 1)
         ])
 
-        # Initialize weights
-        for layer in self.layers:
-            nn.init.xavier_uniform_(layer.weight)
-            nn.init.zeros_(layer.bias)
-
-        # Optimizer
-        if optim == 'adam':
-            self.optimizer = optim.Adam(self.parameters(), lr=self.learning_rate_init, weight_decay=self.alpha_tr)
-        elif optim == 'lbfgs':
-            self.optimizer = optim.LBFGS(self.parameters(), lr=self.learning_rate_init)
-        else:
-            raise ValueError("Only 'adam' and 'lbfgs' are supported solvers.")
+        self._init_linear_weights_xavier_zero_bias(self.layers)
 
     def forward(self, x):
+        """
+        Run the forward pass through multiple hidden layers and asymmetric output.
+        """
+        x = x.to(device=self.layers[0].weight.device, dtype=self.layers[0].weight.dtype)
+
         for layer in self.layers[:-1]:
             x = layer(x)
-            if self.activation == 'relu':
-                x = F.relu(x)
-            elif self.activation == 'tanh':
-                x = torch.tanh(x)
-            elif self.activation == 'sigmoid':
-                x = torch.sigmoid(x)
-        
-        # Output layer with custom transformation
+            x = self._apply_hidden_activation(x)
+
         z = self.layers[-1](x)
-        return torch.where(
-            z < 0,
-            torch.tanh(z) * (1 - 2 * self.alpha),
-            torch.tanh(z) * (1 - 2 * self.beta),
+        return self._apply_asymmetric_output(z, output_act=self.output_act)
+
+    def fit(self, x_train, y_train, sample_weight=None):
+        """
+        Fit the deep asymmetric MLP using the original optimization behavior.
+        """
+        x_train, y_train, sample_weight = self._prepare_training_data(
+            x_train,
+            y_train,
+            sample_weight
         )
 
-    def fit(self, X, y, sample_weight=None):
-        # Handle sample_weight
-        if sample_weight is not None:
-            if isinstance(sample_weight, np.ndarray):
-                sample_weight = torch.from_numpy(sample_weight).float()
+        if y_train.ndimension() == 2 and y_train.shape[1] == 1:
+            y_train_1d = y_train.squeeze(1)
         else:
-            # Initialize weights to 1.0 for all samples if no weights are provided
-            sample_weight = torch.ones_like(y, dtype=torch.float32)
-            
-        X, y = torch.tensor(X, dtype=torch.float32), torch.tensor(y, dtype=torch.float32).unsqueeze(1)
-        batch_size = len(X) if self.batch_size == 'auto' else self.batch_size
-        dataset = torch.utils.data.TensorDataset(X, y)
-        dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
-    
-        criterion = nn.MSELoss()  # Change from BCELoss to MSELoss
-    
-        for epoch in range(self.max_iter):
-            for batch_X, batch_y in dataloader:
-                def closure():
-                    self.optimizer.zero_grad()
-                    outputs = self.forward(batch_X)
-                    loss = criterion(outputs, batch_y)  # Compute MSE loss
-                    loss.backward()
-                    return loss
-    
-                if self.optim == 'adam':
-                    loss = closure()
-                    self.optimizer.step()
-                elif self.optim == 'lbfgs':
-                    self.optimizer.step(closure)
+            y_train_1d = y_train
 
-    def predict(self, X):
-        X = torch.tensor(X, dtype=torch.float32)
-        with torch.no_grad():
-            y_pred = self.forward(X)
-        return (y_pred > 0.0).int().numpy()
-
-    def predict_proba(self, X):
-        X = torch.tensor(X, dtype=torch.float32)
-        with torch.no_grad():
-            y_pred = self.forward(X)
-        return torch.cat([1 - y_pred, y_pred], dim=1).numpy()
-    
-
-# ---------------------------------------------
-# PyTorch implementation of a custom LogReg
-# ---------------------------------------------
-class LogisticRegressionTorch(nn.Module):
-    """
-    Custom Logistic Regression compatible with external training routines.
-    The fit method acts as a wrapper for the ensemble's train_model function.
-    """
-    def __init__(self, input_dim, alpha, beta, loss_fn, optim='adam', max_iter=150, 
-                 learning_rate=0.001, mode='random', batch_size='auto'):
-        super(LogisticRegressionTorch, self).__init__()
-        # Using double precision (float64) for better L-BFGS convergence
-        self.linear = nn.Linear(input_dim, 1).double()
-        self.alpha = alpha
-        self.beta = beta
-        self.loss_fn_e = weighted_mse_loss  # Default to MSE if not found
-        
-        # Training hyperparameters
-        self.optim = optim
-        self.max_iter = max_iter
-        self.learning_rate = learning_rate
-        self.mode = mode
-        self.batch_size = batch_size
-
-    def forward(self, x):
-        """Asymmetric tanh activation."""
-        z = self.linear(x)
-        return torch.where(
-            z < 0,
-            torch.tanh(z) * (1 - 2 * self.alpha),
-            torch.tanh(z) * (1 - 2 * self.beta)
-        )
-
-    def fit(self, X, y, sample_weight=None):
-        """
-        Internal fit that configures the optimizer and calls train_model.
-        """
-        # 1. Prepare data (ensure they are Tensors and double precision)
-        X_tensor = torch.from_numpy(X).double() if isinstance(X, np.ndarray) else X.double()
-        y_tensor = torch.from_numpy(y).double() if isinstance(y, np.ndarray) else y.double()
-        
-        if sample_weight is None:
-            sample_weight = torch.ones(len(X_tensor), dtype=torch.double)
-        else:
-            sample_weight = torch.from_numpy(sample_weight).double() if isinstance(sample_weight, np.ndarray) else sample_weight.double()
-
-        # 2. Configure Optimizer based on self.solver
-        if self.optim == 'lbfgs':
-            # Note: eps should be defined or passed; using 1e-16 as standard for float64
-            eps = 1e-16 
-            optimizer = LBFGSScipy(
-                self.parameters(),
-                max_iter=150,
-                max_eval=150,
-                tolerance_grad=1e-04,
-                tolerance_change=10e6 * eps,
-                history_size=10
+        if self.optim == 'adam':
+            optimizer = self._build_standard_optimizer(
+                'adam',
+                learning_rate=self.learning_rate_init,
+                weight_decay=self.alpha_tr
             )
-            train_model(
-                X_tensor,
-                y_tensor,
-                self,
-                self.loss_fn_e,
-                optimizer,
-                sample_weight,
-                num_epochs=1, # L-BFGS usually needs 1 epoch with full batch
-                batch_size=None,
-                mode=self.mode,
-                lbfgs=True,
-                debug=False
-            )
-        else:
-            if self.optim == 'adam':
-                optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
-            elif self.optim == 'adamw':
-                optimizer = torch.optim.AdamW(self.parameters(), lr=self.learning_rate, weight_decay=1e-2)
-            else:
-                raise ValueError(f"Unsupported optimizer: {self.solver}")
 
-            # 3. Call your specialized training function
-            # We assume weighted_mse_loss is available in the namespace
             train_model(
-                X_tensor,
-                y_tensor,
+                x_train,
+                y_train_1d,
                 self,
-                self.loss_fn_e, # Your custom loss function
+                weighted_mse_loss,
                 optimizer,
                 sample_weight,
                 num_epochs=self.max_iter,
                 batch_size=self.batch_size,
-                mode=self.mode,
-                lbfgs=(self.optim == 'lbfgs'),
+                mode='random',
+                lbfgs=False,
                 debug=False
             )
+        elif self.optim == 'lbfgs':
+            optimizer = self._build_lbfgs_optimizer(
+                max_iter=self.max_iter,
+                max_eval=self.max_iter
+            )
+
+            train_model(
+                x_train,
+                y_train_1d,
+                self,
+                weighted_mse_loss,
+                optimizer,
+                sample_weight,
+                num_epochs=self.max_iter,
+                batch_size=None,
+                mode='random',
+                lbfgs=True,
+                debug=False
+            )
+        else:
+            raise ValueError("Only 'adam' and 'lbfgs' are supported solvers.")
+
         return self
-
-    def predict(self, X):
-        """Binary prediction for sklearn compatibility."""
-        self.eval()
-        X_tensor = torch.from_numpy(X).double() if isinstance(X, np.ndarray) else X.double()
-        with torch.no_grad():
-            outputs = self.forward(X_tensor)
-            return outputs.cpu().numpy().flatten()
-
-    def predict_proba(self, X):
-        """Probability estimation for CalibratedClassifierCV."""
-        self.eval()
-        X_tensor = torch.from_numpy(X).double() if isinstance(X, np.ndarray) else X.double()
-        with torch.no_grad():
-            outputs = self.forward(X_tensor)
-            prob_pos = (outputs + 1) / 2
-            prob_pos = torch.clamp(prob_pos, 0, 1).cpu().numpy().reshape(-1, 1)
-            return np.hstack([1 - prob_pos, prob_pos])
-
-
+    
 class CalibratedBooster(nn.Module):
     """
     Flexible wrapper for boosting/linear models with asymmetric output compression,
@@ -329,19 +1509,62 @@ class CalibratedBooster(nn.Module):
             raise ImportError("CatBoost not installed.")
 
     def _get_model_class(self):
-        """Return model class based on task and model_type."""
+        """
+        Return the estimator class associated with the selected model type and task.
+    
+        For classification tasks, the returned class must expose a classifier-style
+        API, typically including `fit()`, `predict()`, and ideally `predict_proba()`.
+    
+        For regression tasks, the returned class must expose a regressor-style API
+        and be compatible with continuous compressed ALSE-like targets.
+    
+        Returns
+        -------
+        type
+            Estimator class to instantiate later.
+    
+        Raises
+        ------
+        ValueError
+            If the model type is unknown or if the task/model combination is not
+            supported.
+        """
+        # Tree boosting models
         if self.model_type == 'lgbm':
-            return LGBMRegressor if self.task == 'regression' else LGBMClassifier
+            if self.task == 'classification':
+                return LGBMClassifier
+            if self.task == 'regression':
+                return LGBMRegressor
+    
         elif self.model_type == 'xgb':
-            return XGBRegressor if self.task == 'regression' else XGBClassifier
+            if self.task == 'classification':
+                return XGBClassifier
+            if self.task == 'regression':
+                return XGBRegressor
+    
         elif self.model_type == 'cat':
-            return CatBoostRegressor if self.task == 'regression' else CatBoostClassifier
+            if self.task == 'classification':
+                return CatBoostClassifier
+            if self.task == 'regression':
+                return CatBoostRegressor
+    
+        # Random Forest
         elif self.model_type == 'rf':
-            return RandomForestRegressor if self.task == 'regression' else RandomForestClassifier
+            if self.task == 'classification':
+                return RandomForestClassifier
+            if self.task == 'regression':
+                return RandomForestRegressor
+    
+        # Linear / custom logistic-style models
         elif self.model_type == 'logreg':
-            # return LinearRegression if self.task == 'regression' else LogisticRegression
-            return LogisticRegressionTorch if self.task == 'regression' else LogisticRegression
-        raise ValueError(f"Unsupported model_type: {self.model_type}")
+            if self.task == 'classification':
+                return LogisticRegression
+            if self.task == 'regression':
+                return LogisticRegressionTorch
+    
+        raise ValueError(
+            f"Unsupported combination: model_type={self.model_type}, task={self.task}"
+        )
 
     def _get_default_params(self):
         """
@@ -357,21 +1580,23 @@ class CalibratedBooster(nn.Module):
             if self.model_type == 'lgbm':
                 base.update({
                     'boosting_type': 'gbdt',
-                    'objective': 'binary' if self.task == 'classification' else 'regression',
-                    'metric': 'binary_logloss' if self.task == 'classification' else 'rmse',
+                    'n_jobs': 1,
+                    # 'objective': 'binary' if self.task == 'classification' else 'regression',
+                    # 'metric': 'binary_logloss' if self.task == 'classification' else 'rmse',
                     'verbosity': -1,
                     'force_col_wise': True,
                     # Tree Structure
                     'max_depth': -1,
-                    'num_leaves': 31,
+                    'num_leaves': 50,
+                    'subsample': 0.8,
                     'min_child_samples': 20,
-                    'min_child_weight': 1e-3,
+                    # 'min_child_weight': 1e-3,
                     # Learning
                     'learning_rate': 0.1,
-                    'n_estimators': 60,
+                    'n_estimators': 100,
                     # Regularization
-                    'reg_alpha': 0.0,
-                    'reg_lambda': 0.0,
+                    # 'reg_alpha': 0.0,
+                    # 'reg_lambda': 0.0,
                     # Imbalance handling
                     'is_unbalance': True if self.task == 'classification' else False,
                 })
@@ -389,7 +1614,7 @@ class CalibratedBooster(nn.Module):
                     'reg_lambda': 0.0,
                     'reg_alpha': 0.0,
                     'tree_method': 'hist',
-                    'n_jobs': -1,
+                    'n_jobs': 1,
                 })
                 # Note: scale_pos_weight is injected dynamically in fit()
 
@@ -403,7 +1628,7 @@ class CalibratedBooster(nn.Module):
                     'subsample': 1.0,
                     'grow_policy': 'Depthwise',
                     'logging_level': 'Silent',
-                    'thread_count': -1,
+                    'thread_count': 1,
                 })
                 # Add balance weights for CatBoost
                 if self.task == 'classification':
@@ -429,7 +1654,7 @@ class CalibratedBooster(nn.Module):
             return base
 
         elif self.model_type == 'rf':
-            return {
+            params = {
                 'n_estimators': 60,
                 'max_depth': None,
                 'min_samples_leaf': 1,
@@ -438,26 +1663,30 @@ class CalibratedBooster(nn.Module):
                 'bootstrap': True,
                 'n_jobs': -1,
                 'random_state': 42,
-                # Dynamic balancing per tree (robust for imbalanced dichotomies)
-                'class_weight': 'balanced_subsample' if self.task == 'classification' else None
             }
-
+    
+            if self.task == 'classification':
+                params['class_weight'] = 'balanced_subsample'
+    
+            return params
         elif self.model_type == 'logreg':
             if self.task == 'classification':
                 return {
-                    'solver': 'lbfgs',
-                    'max_iter': 500,
-                    'C': 1.0,
+                    'max_iter': 50000,
+                    'C': 0.000001,
                     'random_state': 42,
-                    'class_weight': 'balanced',
-                    'n_jobs': -1
+                    # 'class_weight': 'balanced',
+                    'n_jobs': 1,
+                    'tol': 0.001,
+                    'solver': "saga",
+                    'penalty': "l2"
                 }
-            else: # ALSE Regression
+            else: # ALSE LogisticRegressionTorch
                 return {
                     'alpha': self.alpha,
                     'beta': self.beta,
-                    'solver': 'lbfgs',
-                    'max_iter': 200,
+                    'optim': 'lbfgs',
+                    'max_iter': 500,
                     'loss_fn': weighted_mse_loss # Custom loss for switching
                 }
 
@@ -465,133 +1694,209 @@ class CalibratedBooster(nn.Module):
 
     def fit(self, X, y, sample_weight=None):
         """
-        Fit model and optional calibrator with unified weight scaling.
-        Estimates Pr_S(C1|X) to satisfy the ALSE soft output requirement.
+        Fit the base model and, optionally, an isotonic calibrator.
+    
+        In classification mode:
+        - the base estimator is trained on binary labels,
+        - the optional calibrator maps raw positive-class probabilities into the
+          compressed ALSE-compatible output space.
+    
+        In regression mode:
+        - the base estimator is trained directly on the compressed target,
+        - the optional calibrator refines predictions while preserving the same
+          theoretical output bounds.
         """
-        # 1. Standardize inputs to NumPy and compute Imbalance Ratio (IR)
+        # Input standardization
         X_np = X.detach().cpu().numpy() if isinstance(X, torch.Tensor) else X
         y_np = y.detach().cpu().numpy() if isinstance(y, torch.Tensor) else y
-        ir = compute_imbalance_ratio(y_np)
+    
+        # Theoretical bounds in z-space
+        z_lower = - (1.0 - 2.0 * self.alpha)  # negative
+        z_upper = (1.0 - 2.0 * self.beta)     # positive
+    
+        # Imbalance ratio for binary labels.
+        ir = compute_imbalance_ratio(y_np > 0)
         
+        # effective_weights are used in the first fit and contain only external
+        # sample weights. Class imbalance is handled by native model parameters
+        # when available, e.g. XGBoost scale_pos_weight="auto" resolved to IR.
+        #
+        # calib_weights are used for calibration/regression and additionally weight
+        # positives by IR. Do not use them in the first classifier fit to avoid
+        # double-counting class imbalance.
+        effective_weights = (
+            np.asarray(sample_weight, dtype=NUMPY_DTYPE).copy()
+            if sample_weight is not None
+            else np.ones_like(y_np, dtype=NUMPY_DTYPE)
+        )
+        
+        calib_weights = np.where(y_np > 0, ir, 1.0) * effective_weights
+        
+        # Prepare model.
         model_class = self._get_model_class()
         model_name = model_class.__name__
-
-        # 2. Parameter Preparation: Priority is given to self.model_params
-        params = {**self._get_default_params(), **self.model_params}
-
-        # 3. Dynamic Imbalance Injection: Only if not already handled by the user
-        if model_name in ['LGBMClassifier', 'XGBClassifier']:
-            # Check if user already provided an imbalance strategy
-            is_handled = params.get('is_unbalance') or params.get('scale_pos_weight')
-            if not is_handled and ir > 1:
-                params['scale_pos_weight'] = ir
         
-        # 4. Sample Weights setup
-        effective_weights = np.array(sample_weight, dtype=float).copy() if sample_weight is not None else np.ones_like(y_np, dtype=float)
-
-        # 5. Model Initialization
-        if model_name == 'LogisticRegressionTorch':
-            params['input_dim'] = X_np.shape[1]
-            
+        params = {**self._get_default_params(), **self.model_params}
+        
+        # Resolve XGBoost imbalance parameter.
+        if "XGB" in model_name:
+            scale_pos_weight = params.get("scale_pos_weight", None)
+        
+            if scale_pos_weight == "auto":
+                params["scale_pos_weight"] = ir
+            elif scale_pos_weight is None and ir > 1:
+                params["scale_pos_weight"] = ir
+        
+        # Custom torch model support.
+        if model_name == "LogisticRegressionTorch":
+            params["input_dim"] = X_np.shape[1]
+        
         self.model = model_class(**params)
-
-        # 6. Task Execution
-        if self.task == 'classification':
+    
+        # LGBM compatibility: convert to DataFrame if needed
+        X_fit = X_np
+        if "LGBM" in model_name:
+            feature_names = [f"f{i}" for i in range(X_np.shape[1])]
+            X_fit = pd.DataFrame(X_np, columns=feature_names)
+    
+        # ────────────────────────────────────────────────
+        #               Task-specific training
+        # ────────────────────────────────────────────────
+        if self.task == "classification":
+            # Binarize for training the classifier
             y_train = (y_np > 0).astype(int)
-            
-            if "LGBM" in model_name:
-                feature_names = [f'f{i}' for i in range(X_np.shape[1])]
-                X_np = pd.DataFrame(X_np, columns=feature_names)
-                
-            self.model.fit(X_np, y_train, sample_weight=effective_weights)
-            
-            # Calibration: Mapping scores to Pr_S in [alpha, 1-beta]
-            if self.calibration_method == 'isotonic':
-                raw_probs = self.model.predict_proba(X_np)[:, 1]
-                y_pr_s = 0.5 * (y_np + 1)
-                
-                # Fit with strict theoretical boundaries
+            self.model.fit(X_fit, y_train, sample_weight=effective_weights)
+    
+            if self.calibration_method == "isotonic":
+                raw_probs = self.model.predict_proba(X_fit)[:, 1]
+    
+                # Convert compressed y back to probability-like space for isotonic target
+                p_target = np.clip(0.5 * (y_np + 1.0), self.alpha, 1.0 - self.beta)
+                   
                 self.calibrator = IsotonicRegression(
-                    y_min=self.alpha, 
-                    y_max=1 - self.beta, 
-                    out_of_bounds='clip'
+                    y_min=self.alpha,
+                    y_max=1.0 - self.beta,
+                    out_of_bounds="clip"
                 )
-                self.calibrator.fit(raw_probs, y_pr_s, sample_weight=effective_weights)
-                
-        else:  # Regression mode
-            if "LGBM" in model_name:
-                feature_names = [f'f{i}' for i in range(X_np.shape[1])]
-                X_np = pd.DataFrame(X_np, columns=feature_names)
-
-            self.model.fit(X_np, y_np, sample_weight=effective_weights)
-            
-            if self.calibration_method == 'isotonic':
-                preds = self.model.predict(X_np)
-                self.calibrator = IsotonicRegression(out_of_bounds='clip')
-                self.calibrator.fit(preds, y_np, sample_weight=effective_weights)
-
+                self.calibrator.fit(raw_probs, p_target, sample_weight=calib_weights)
+    
+        else:  # regression
+            # Safety clip (just in case of tiny numerical drift)
+            y_train = np.clip(y_np, z_lower, z_upper)
+            self.model.fit(X_fit, y_train, sample_weight=calib_weights)
+    
+            if self.calibration_method == "isotonic":
+                raw_pred = self.model.predict(X_fit)
+    
+                self.calibrator = IsotonicRegression(
+                    y_min=z_lower,
+                    y_max=z_upper,
+                    out_of_bounds="clip"
+                )
+                self.calibrator.fit(raw_pred, y_train, sample_weight=calib_weights)
+    
         self._is_fitted = True
         return self
-
-    def forward(self, x):
+    
+    
+    def forward(self, X):
         """
-        Perform forward pass and apply linear probability transformation.
-        The output maps to z = 2*Pr_S - 1, respecting alpha/beta bounds.
+        Run inference and return the compressed ALSE-compatible output.
+    
+        The returned value is always in compressed output space:
+    
+            z in [z_min, z_max]
+    
+        with:
+            z_min = -(1 - 2 * alpha)
+            z_max = +(1 - 2 * beta)
+    
+        In classification mode:
+        - without calibration, probabilities are converted as z = 2p - 1;
+        - with isotonic calibration, the calibrator is assumed to return z directly.
+    
+        In regression mode:
+        - the base model already predicts z-like values;
+        - the optional calibrator refines them in the same output space.
         """
         if not self._is_fitted:
             raise RuntimeError("Model must be fitted before inference.")
     
-        # 1. Input conversion
-        x_np = x.detach().cpu().numpy() if isinstance(x, torch.Tensor) else x
-        model_name = self._get_model_class().__name__
-        
-        if "LGBM" in model_name:
-            feature_names = [f'f{i}' for i in range(x_np.shape[1])]
-            x_np = pd.DataFrame(x_np, columns=feature_names)
+        # Input preparation
+        X_np = X.detach().cpu().numpy() if isinstance(X, torch.Tensor) else X
     
-        # 2. Prediction & Calibration
-        if self.task == 'classification':
-            probs = self.model.predict_proba(x_np)[:, 1]
-            if self.calibrator:
-                probs = self.calibrator.transform(probs)
-            
-            # Final safety clip before linear mapping
-            probs = np.clip(probs, self.alpha, 1 - self.beta)
-            z_np = 2 * probs - 1
+        if "LGBM" in self._get_model_class().__name__:
+            feature_names = [f"f{i}" for i in range(X_np.shape[1])]
+            X_np = pd.DataFrame(X_np, columns=feature_names)
+    
+        # Theoretical bounds in z-space (z = 2p - 1)
+        z_lower = - (1.0 - 2.0 * self.alpha)  # negative
+        z_upper = (1.0 - 2.0 * self.beta)     # positive
+    
+        # Get raw prediction in z-space
+        if self.task == "classification":
+            raw_probs = self.model.predict_proba(X_np)[:, 1]
+    
+            if self.calibrator is not None:
+                z_np = 2.0 * self.calibrator.transform(raw_probs) - 1.0
+            else:
+                clipped_probs = np.clip(raw_probs, self.alpha, 1.0 - self.beta)
+                z_np = 2.0 * clipped_probs - 1.0
         else:
-            z_np = self.model.predict(x_np)
-            if self.calibrator:
+            z_np = self.model.predict(X_np)
+            if self.calibrator is not None:
                 z_np = self.calibrator.transform(z_np)
     
-        # 3. Conversion to Torch
-        z = torch.as_tensor(z_np, device=x.device, dtype=torch.float32)
+        # Convert to torch once
+        device = X.device if isinstance(X, torch.Tensor) else torch.device("cpu")
+        
+        z = torch.as_tensor(z_np, device=device, dtype=torch.float32)
         if z.dim() == 1:
             z = z.unsqueeze(1)
-            
-        # 4. Final Clipping (No tanh distortion if output_act=0)
-        neg_bound = (1 - 2 * self.alpha)
-        pos_bound = (1 - 2 * self.beta)
-        
-        if self.output_act == 0:
-            return torch.clamp(z, -neg_bound, pos_bound)
-        
-        # Non-linear activation fallback (only if specifically requested)
+    
+        # Optional asymmetric tanh compression
         if self.output_act == 1:
-            return torch.where(z < 0, neg_bound * torch.tanh(z), pos_bound * torch.tanh(z))
-        
-        return torch.clamp(z, -neg_bound, pos_bound)
-
+            z = torch.where(
+                z < 0,
+                z_lower * torch.tanh(z / z_lower),
+                z_upper * torch.tanh(z / z_upper)
+            )
+    
+        # Single final clamp (covers both cases)
+        z = torch.clamp(z, min=z_lower, max=z_upper)
+    
+        return z
+    
+    
     def predict(self, X):
-        """Predict class label from sign of compressed output."""
-        return self.forward(X).cpu().numpy()
-
+        """
+        Return the compressed model output.
+    
+        This method mirrors forward() and therefore returns values in the
+        theoretical compressed range [z_min, z_max].
+        """
+        return self.forward(X).detach().cpu().numpy()
+    
+    
     def predict_proba(self, X):
-        """Approximate class probabilities from compressed output."""
-        compressed = self.forward(X)
-        probs = (compressed + 1) / 2
-        probs = torch.clamp(probs, self.alpha, 1-self.beta)
-        return torch.stack([1 - probs, probs], dim=1).cpu().numpy()
-
+        """
+        Return approximate class probabilities derived from the compressed output.
+    
+        The conversion is:
+    
+            p = 0.5 * (z + 1)
+    
+        followed by clipping to the valid asymmetric probability range:
+    
+            p in [alpha, 1 - beta]
+        """
+        z = self.forward(X).squeeze(1)
+    
+        probs_pos = 0.5 * (z + 1.0)
+        probs_pos = torch.clamp(probs_pos, min=self.alpha, max=1.0 - self.beta)
+        probs_neg = 1.0 - probs_pos
+    
+        return torch.stack([probs_neg, probs_pos], dim=1).cpu().numpy()
 
 # ---------------------------------------------
 # PyTorch implementation of a custom MLP Bayes

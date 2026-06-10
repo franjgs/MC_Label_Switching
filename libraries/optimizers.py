@@ -11,7 +11,6 @@ from libraries.functions import generate_batches
 
 eps=np.finfo(float).eps
 
-
 # LBFGSScipy: taken from https://gist.github.com/arthurmensch/c55ac413868550f89225a0b9212aa4cd
 class LBFGSScipy(Optimizer):
     """Wrap L-BFGS algorithm, using scipy routines.
@@ -93,41 +92,77 @@ class LBFGSScipy(Optimizer):
         assert offset == self._numel()
 
     def step(self, closure):
-        """Performs a single optimization step.
-        Arguments:
-            closure (callable): A closure that reevaluates the model
-                and returns the loss.
+        """
+        Perform a single outer optimization step using SciPy L-BFGS-B.
+    
+        Parameters
+        ----------
+        closure : callable
+            Closure that reevaluates the model, computes the loss, and performs
+            backward propagation. It must call zero_grad() internally.
+    
+        Returns
+        -------
+        torch.Tensor or None
+            Final loss recorded during the SciPy optimization call.
         """
         assert len(self.param_groups) == 1
-
+    
         group = self.param_groups[0]
         max_iter = group['max_iter']
         max_eval = group['max_eval']
         tolerance_grad = group['tolerance_grad']
         tolerance_change = group['tolerance_change']
         history_size = group['history_size']
-
+    
+        first_param = self._params[0]
+        param_dtype = first_param.dtype
+        param_device = first_param.device
+    
         def wrapped_closure(flat_params):
-            """closure must call zero_grad() and backward()"""
-            flat_params = torch.from_numpy(flat_params)
-            self._distribute_flat_params(flat_params)
+            """
+            SciPy-compatible closure. The provided flat parameters are injected
+            into the model before reevaluating the objective.
+            """
+            flat_params_torch = torch.from_numpy(flat_params).to(
+                device=param_device,
+                dtype=param_dtype
+            )
+            self._distribute_flat_params(flat_params_torch)
+    
             loss = closure()
             self._last_loss = loss
-            loss = loss.data
-            flat_grad = self._gather_flat_grad().numpy()
-            return loss, flat_grad
-
+    
+            loss_value = float(loss.detach().cpu().item())
+            flat_grad = self._gather_flat_grad().detach().cpu().numpy()
+    
+            return loss_value, flat_grad
+    
         def callback(flat_params):
             self._n_iter += 1
-
-        initial_params = self._gather_flat_params()
-
-        
-        fmin_l_bfgs_b(wrapped_closure, initial_params, maxiter=max_iter,
-                      maxfun=max_eval,
-                      factr=tolerance_change / eps, pgtol=tolerance_grad, epsilon=1e-08,
-                      m=history_size,
-                      callback=callback)
+    
+        initial_params = self._gather_flat_params().detach().cpu().numpy()
+    
+        result = fmin_l_bfgs_b(
+            wrapped_closure,
+            initial_params,
+            maxiter=max_iter,
+            maxfun=max_eval,
+            factr=tolerance_change / eps,
+            pgtol=tolerance_grad,
+            epsilon=1e-08,
+            m=history_size,
+            callback=callback
+        )
+    
+        # Explicitly distribute the final parameters returned by SciPy.
+        final_params = torch.from_numpy(result[0]).to(
+            device=param_device,
+            dtype=param_dtype
+        )
+        self._distribute_flat_params(final_params)
+    
+        return self._last_loss
         
         
 def create_dataloader(X, y, weights, batch_size, mode='random', seed=42):
@@ -162,63 +197,177 @@ def create_dataloader(X, y, weights, batch_size, mode='random', seed=42):
     return dataloader
 
 
-def train_model(x, y, model, loss_fn, optimizer, weights, num_epochs=10, batch_size=None, mode='random', lbfgs=False, debug=False):
+def train_model(
+    x,
+    y,
+    model,
+    loss_fn,
+    optimizer,
+    weights,
+    num_epochs=10,
+    batch_size=None,
+    mode='random',
+    lbfgs=False,
+    debug=False,
+    early_stopping=False,
+    es_patience=5,
+    es_tol=1e-4,
+    normalize_monitor_loss=True
+):
     """
-    Train a model using either gradient-based optimizers or LBFGS.
+     Train a model using either gradient-based optimizers or LBFGS.
     
-    Parameters:
-    - x: Features (torch.Tensor).
-    - y: Labels (torch.Tensor).
-    - model: PyTorch model to train.
-    - loss_fn: Loss function (callable).
-    - optimizer: Optimizer instance (torch.optim or LBFGSScipy).
-    - weights: Sample weights (torch.Tensor).
-    - num_epochs: Maximum number of epochs (int).
-    - batch_size: Batch size for DataLoader (int).
-    - mode: Sampling mode for DataLoader ('random', 'class_equitative', etc.).
-    - lbfgs: If True, use LBFGS optimization logic (bool).
-    - debug: If True, print debug information.
-    """
+     Parameters
+     ----------
+     x : torch.Tensor
+         Input features.
+     y : torch.Tensor
+         Target labels.
+     model : torch.nn.Module
+         PyTorch model to train.
+     loss_fn : callable
+         Loss function with signature loss_fn(outputs, labels, weights).
+     optimizer : torch.optim.Optimizer
+         Optimizer instance.
+     weights : torch.Tensor
+         Per-sample training weights.
+     num_epochs : int, optional
+         Maximum number of training epochs.
+     batch_size : int or str or None, optional
+         Batch size for the data loader. For LBFGS, full-batch mode is enforced.
+     mode : str, optional
+         Sampling mode for the data loader.
+     lbfgs : bool, optional
+         If True, use LBFGS optimization logic.
+     debug : bool, optional
+         If True, print debug information.
+     early_stopping : bool, optional
+         If True, stop training when the epoch loss stops improving.
+     es_patience : int, optional
+         Number of consecutive epochs allowed without meaningful improvement.
+     es_tol : float, optional
+         Minimum relative improvement required to reset patience.
+         For example, es_tol=1e-4 means that the epoch loss must improve by
+         more than 0.01% relative to the best loss seen so far.
     
-    # Set batch_size to full dataset length if not specified (standard for L-BFGS)
-    batch_size = len(x) if batch_size is None or batch_size == 'auto' else int(batch_size)
-    trainloader = create_dataloader(x, y, weights, batch_size=batch_size, mode=mode)
+     Returns
+     -------
+     torch.nn.Module
+         Trained model.
+     """
+    
+    if lbfgs:
+        effective_batch_size = len(x)
+    else:
+        effective_batch_size = len(x) if batch_size is None or batch_size == 'auto' else int(batch_size)
 
-    # Dynamically detect the model's dtype to avoid precision mismatch (float32 vs float64)
-    model_dtype = next(model.parameters()).dtype
-    
+    trainloader = create_dataloader(
+        x,
+        y,
+        weights,
+        batch_size=effective_batch_size,
+        mode=mode
+    )
+
+    first_param = next(model.parameters(), None)
+    if first_param is None:
+        model_dtype = torch.float32
+        model_device = torch.device("cpu")
+    else:
+        model_dtype = first_param.dtype
+        model_device = first_param.device
+
+    model.train()
+
+    best_epoch_loss = np.inf
+    no_improve_count = 0
+
     for epoch in range(num_epochs):
+        epoch_loss_sum = 0.0
+        epoch_sample_count = 0
+
         for batch_idx, (features, labels, batch_weights) in enumerate(trainloader):
-            # Sync input data types with the model's parameters
-            features = features.to(model_dtype)
-            labels = labels.to(model_dtype).view(-1, 1)
-            batch_weights = batch_weights.to(model_dtype).view(-1, 1)
-            
+            features = features.to(device=model_device, dtype=model_dtype)
+            labels = labels.to(device=model_device, dtype=model_dtype).view(-1, 1)
+            batch_weights = batch_weights.to(device=model_device, dtype=model_dtype).view(-1, 1)
+
+            batch_n = int(features.shape[0])
+
             if lbfgs:
-                # Define closure for LBFGS optimizer
                 def closure():
+                    """Compute LBFGS loss and gradients for the current full batch."""
                     optimizer.zero_grad()
                     outputs = model(features)
                     loss = loss_fn(outputs, labels, batch_weights)
                     loss.backward()
                     return loss
-                
-                # Perform optimization step
-                # L-BFGS step calls the closure multiple times to estimate the Hessian
-                optimizer.step(closure)
-                current_loss = closure().item()
+
+                step_result = optimizer.step(closure)
+                raw_loss = float(step_result.detach().cpu().item())
+
             else:
-                # Standard gradient descent step (SGD, Adam, etc.)
                 optimizer.zero_grad()
                 outputs = model(features)
                 loss = loss_fn(outputs, labels, batch_weights)
                 loss.backward()
                 optimizer.step()
-                current_loss = loss.item()
-    
-            # Debug logging
+                raw_loss = float(loss.detach().cpu().item())
+
+            # Use raw_loss for optimization, but normalized loss for monitoring.
+            if normalize_monitor_loss:
+                monitored_batch_loss = raw_loss / max(batch_n, 1)
+            else:
+                monitored_batch_loss = raw_loss
+
+            epoch_loss_sum += monitored_batch_loss * batch_n
+            epoch_sample_count += batch_n
+
+            """
             if debug and batch_idx % 10 == 0:
-                print(f"Epoch {epoch + 1}, Batch {batch_idx + 1}, Loss: {current_loss:.5f}")
+                print(
+                    f"Epoch {epoch + 1}, Batch {batch_idx + 1}, "
+                    f"raw_loss={raw_loss:.5f}, "
+                    f"monitored_loss={monitored_batch_loss:.8f}, "
+                    f"batch_size={batch_n}"
+                )
+            """
+        epoch_loss = epoch_loss_sum / max(epoch_sample_count, 1)
+
+        if debug:
+            print(
+                f"Epoch {epoch + 1} completed | "
+                f"normalized_epoch_loss={epoch_loss:.8f} | "
+                f"samples={epoch_sample_count}"
+            )
+
+        if early_stopping:
+            if np.isfinite(best_epoch_loss):
+                rel_improvement = (best_epoch_loss - epoch_loss) / max(abs(best_epoch_loss), 1e-12)
+            else:
+                rel_improvement = np.inf
+
+            if rel_improvement > es_tol:
+                best_epoch_loss = epoch_loss
+                no_improve_count = 0
+            else:
+                no_improve_count += 1
+
+            if debug:
+                print(
+                    f"Early stopping monitor | "
+                    f"best_loss={best_epoch_loss:.8f} | "
+                    f"current_loss={epoch_loss:.8f} | "
+                    f"rel_improvement={rel_improvement:.6e} | "
+                    f"no_improve_count={no_improve_count}/{es_patience}"
+                )
+
+            if no_improve_count >= es_patience:
+                if debug:
+                    print(
+                        f"Stopping early at epoch {epoch + 1} after "
+                        f"{es_patience} epochs without sufficient relative improvement."
+                    )
+                break
 
     return model
 
@@ -373,3 +522,12 @@ def f1_loss(predict, target, weights=None):
     macro_cost = cost.mean()  # Average on all labels
     
     return macro_cost + loss
+
+# Mapping for loss functions
+LOSS_FUNCTIONS = {
+    "MSE": weighted_mse_loss,
+    "KL": weighted_kl_loss,
+    "BCE": weighted_bce_loss,
+    "BCE_logit": weighted_bce_logit_loss,
+    "F1": f1_loss,
+}

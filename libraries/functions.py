@@ -8,9 +8,10 @@ Created on Thu Mar  6 18:51:23 2025
 import numpy as np
 import yaml
 import logging
+import os
 from itertools import product
+import copy
 import importlib
-
 import random
 
 from sklearn.metrics import f1_score, cohen_kappa_score, matthews_corrcoef
@@ -61,7 +62,20 @@ def get_class_from_string(class_path):
     module = importlib.import_module(module_path)
     return getattr(module, class_name)
 
-def load_config(filepath="config.yaml"):
+def load_config(filepath="config/config.yaml"):
+    """
+    Load a YAML configuration file.
+
+    Legacy script names such as config_train.yaml and config_test.yaml are
+    resolved to config/config.yaml when no file exists at the requested path.
+    """
+    if not os.path.exists(filepath) and os.path.basename(filepath) in {
+        "config.yaml",
+        "config_train.yaml",
+        "config_test.yaml",
+    }:
+        filepath = os.path.join("config", "config.yaml")
+
     with open(filepath, "r") as f:
         config = yaml.safe_load(f)
     return config
@@ -84,164 +98,852 @@ def setup_logger(config):
 
     return logger
 
-def generate_model_configurations(model_list):
-    """Generates full model configurations from the model list, including LSEnsemble optimization logic."""
-    CV_config = {}
+def _get_resolver_logger(logger=None):
+    """
+    Return the logger used by configuration resolver utilities.
+
+    Parameters
+    ----------
+    logger : logging.Logger or None, optional
+        External logger. If None, the module logger is used.
+
+    Returns
+    -------
+    logging.Logger
+        Logger instance.
+    """
+    return logger if logger is not None else logging.getLogger(__name__)
+
+
+def _expand_lse_rebalance_values(values, param_name, qp_tr):
+    """
+    Expand LSE rebalance YAML specifications into explicit numeric search values.
+
+    Supported conventions
+    ---------------------
+    Explicit list:
+        [1, 2, 4, 8]
+    Auto range:
+        ['auto', n] -> np.linspace(1, qp_tr, n)
+    Full imbalance:
+        ['full'] -> [qp_tr]
+
+    Parameters
+    ----------
+    values : list
+        Raw YAML value list for one rebalance hyperparameter.
+    param_name : str
+        Parameter name used in error messages.
+    qp_tr : float
+        Imbalance ratio of the current training split.
+
+    Returns
+    -------
+    tuple
+        Tuple with:
+        - resolved list of values
+        - mode string in {'normal', 'auto', 'full'}
+    """
+    if not isinstance(values, list) or len(values) == 0:
+        raise ValueError(
+            f"Invalid {param_name} configuration. Expected a non-empty list."
+        )
+
+    if values[0] == "auto":
+        if len(values) > 1 and isinstance(values[1], int) and values[1] > 0:
+            n_items = values[1]
+            return np.linspace(1, qp_tr, n_items).tolist(), "auto"
+
+        raise ValueError(
+            f"Invalid {param_name} configuration. "
+            "When using ['auto', n], n must be a positive integer."
+        )
+
+    if values[0] == "full":
+        return [qp_tr], "full"
+
+    return values, "normal"
+
+
+def _expand_lse_alpha_values(values, qp_tr):
+    """
+    Expand the special LS_alpha YAML specification into explicit search values.
+
+    Supported conventions
+    ---------------------
+    Explicit list:
+        [0, 0.05, 0.1, 0.15]
+    Auto alpha grid:
+        ['auto', n] -> local grid around estimate_alpha(qp_tr)
+
+    The automatic alpha grid is built as:
+
+        np.linspace(
+            max(0.0, alpha_start - 0.2),
+            min(0.45, alpha_start + 0.2),
+            n
+        )
+
+    where alpha_start = estimate_alpha(qp_tr).
+
+    Parameters
+    ----------
+    values : list
+        Raw YAML value list for LS_alpha.
+    qp_tr : float
+        Imbalance ratio of the current training split.
+
+    Returns
+    -------
+    tuple
+        Tuple with:
+        - resolved list of alpha values
+        - mode string in {'normal', 'auto'}
+    """
+    if not isinstance(values, list) or len(values) == 0:
+        raise ValueError(
+            "Invalid LS_alpha configuration. Expected a non-empty list."
+        )
+
+    if values[0] == "auto":
+        if len(values) > 1 and isinstance(values[1], int) and values[1] > 0:
+            n_items = values[1]
+            alpha_start = estimate_alpha(qp_tr)
+            resolved = np.round(
+                np.linspace(
+                    max(0.0, alpha_start - 0.2),
+                    min(0.45, alpha_start + 0.2),
+                    n_items
+                ),
+                3
+            ).tolist()
+            return resolved, "auto"
+
+        raise ValueError(
+            "Invalid LS_alpha configuration. "
+            "When using ['auto', n], n must be a positive integer."
+        )
+
+    if values[0] == "full":
+        raise ValueError(
+            "Invalid LS_alpha configuration. The 'full' mode is not defined for LS_alpha."
+        )
+
+    return values, "normal"
+
+def _filter_lse_dynamic_params_by_base_learner(dynamic_params, base_learner, optim=None):
+    """
+    Filter the LSE dynamic search space according to the selected base learner
+    and optimization method.
+
+    The goal is to avoid generating redundant Cartesian-product combinations
+    with hyperparameters that are ignored by the underlying expert type.
+
+    This helper is mainly used for the legacy flat LSE YAML format. When the
+    structured format with ``base_learner_configs`` is used, the resolver should
+    keep only global LSE parameters and let ``LSEnsemble`` resolve the selected
+    base-learner block internally.
+
+    Parameters
+    ----------
+    dynamic_params : dict
+        Resolved dynamic LSE parameter grid.
+    base_learner : str
+        Selected expert family.
+    optim : str or None, optional
+        Optimizer name from the fixed model parameters.
+
+    Returns
+    -------
+    dict
+        Filtered dynamic parameter dictionary.
+    """
+    always_keep = {
+        "alpha",
+        "beta",
+        "Q_C",
+        "Q_RB_S",
+        "Q_RB_C",
+        "num_experts",
+    }
+
+    shallow_or_deep_mlp_params = {
+        "hidden_size",
+        "drop_out",
+        "n_batch",
+        "n_epoch",
+    }
+
+    mlp_like = {
+        "FAMLP",
+        "AMLP",
+        "DAMLP",
+        "Parzen",
+    }
+
+    # ``mode`` controls minibatch generation. It is meaningful for minibatch
+    # optimizers and for warm_start_lbfgs, because the warm-start phase uses
+    # minibatches. Pure LBFGS ignores it.
+    mode_applicable = False
+
+    if base_learner in ("FAMLP", "Parzen"):
+        mode_applicable = True
+    elif base_learner in ("AMLP", "DAMLP", "LogReg") and optim != "lbfgs":
+        mode_applicable = True
+
+    if base_learner in mlp_like:
+        allowed = always_keep | shallow_or_deep_mlp_params
+
+    elif base_learner == "LogReg":
+        allowed = always_keep | {
+            "n_epoch",
+            "n_batch",
+        }
+
+    elif base_learner == "CalibratedBooster":
+        allowed = always_keep
+
+    else:
+        # Conservative fallback for legacy/custom neural learners.
+        allowed = always_keep | shallow_or_deep_mlp_params
+
+    if mode_applicable:
+        allowed = allowed | {"mode"}
+
+    filtered = {}
+    for key, value in dynamic_params.items():
+        if key in allowed:
+            filtered[key] = value
+
+    return filtered
+
+def _prune_lse_params_by_base_learner(config, base_learner, optim=None):
+    """
+    Remove LSE constructor parameters that do not apply to the selected
+    base learner family.
+
+    This helper is mainly used for the legacy flat LSE YAML format. In the
+    structured format with ``base_learner_configs``, base-learner-specific
+    values remain inside the selected learner block and are resolved by
+    ``LSEnsemble`` itself.
+
+    Parameters
+    ----------
+    config : dict
+        Constructor-ready parameter dictionary.
+    base_learner : str
+        Selected expert family.
+    optim : str or None, optional
+        Optimizer name when relevant.
+
+    Returns
+    -------
+    dict
+        Pruned configuration dictionary.
+    """
+    pruned = dict(config)
+
+    if base_learner == "CalibratedBooster":
+        for key in (
+            "activation_fn",
+            "optim",
+            "loss_fn",
+            "drop_out",
+            "n_batch",
+            "n_epoch",
+            "mode",
+            "hidden_size",
+            "hidden_layer_sizes",
+            "output_act",
+            "learning_rate",
+            "weight_decay",
+            "debug",
+            "early_stopping",
+            "es_patience",
+            "es_tol",
+            "lbfgs_max_iter",
+            "lbfgs_max_eval",
+            "warm_start",
+            "warm_start_optim",
+            "warm_start_n_epoch",
+            "warm_start_n_batch",
+            "warm_start_mode",
+            "warm_start_learning_rate",
+            "warm_start_weight_decay",
+            "warm_start_debug",
+        ):
+            pruned.pop(key, None)
+
+    elif base_learner == "LogReg":
+        for key in (
+            "activation_fn",
+            "loss_fn",
+            "drop_out",
+            "hidden_size",
+            "hidden_layer_sizes",
+            "learning_rate",
+            "weight_decay",
+            "lbfgs_max_iter",
+            "lbfgs_max_eval",
+            "warm_start",
+            "warm_start_optim",
+            "warm_start_n_epoch",
+            "warm_start_n_batch",
+            "warm_start_mode",
+            "warm_start_learning_rate",
+            "warm_start_weight_decay",
+            "warm_start_debug",
+        ):
+            pruned.pop(key, None)
+
+        if optim == "lbfgs":
+            pruned.pop("mode", None)
+            pruned.pop("n_batch", None)
+
+    elif base_learner == "Parzen":
+        for key in (
+            "optim",
+            "loss_fn",
+            "learning_rate",
+            "weight_decay",
+            "debug",
+            "early_stopping",
+            "es_patience",
+            "es_tol",
+            "lbfgs_max_iter",
+            "lbfgs_max_eval",
+            "warm_start",
+            "warm_start_optim",
+            "warm_start_n_epoch",
+            "warm_start_n_batch",
+            "warm_start_mode",
+            "warm_start_learning_rate",
+            "warm_start_weight_decay",
+            "warm_start_debug",
+            "hidden_layer_sizes",
+        ):
+            pruned.pop(key, None)
+
+    elif base_learner in ("AMLP", "DAMLP", "FAMLP"):
+        # Pure LBFGS is full-batch, so minibatch-specific parameters are ignored.
+        # For warm_start_lbfgs, mode and n_batch are kept because they apply to
+        # the warm-start minibatch phase.
+        if optim == "lbfgs":
+            pruned.pop("mode", None)
+            pruned.pop("n_batch", None)
+
+    return pruned
+def _resolve_lse_model_configurations(model_item, x_train=None, y_train_lab=None, logger=None):
+    """
+    Resolve one LSEnsemble YAML block into constructor-ready configurations.
+
+    This function interprets the declarative LSE YAML syntax after the current
+    training split is available, because some hyperparameter specifications
+    depend on the imbalance ratio of y_train_lab.
+
+    Two YAML styles are supported:
+
+    1. Legacy flat LSE configuration:
+       Base-learner-specific parameters such as hidden_size, n_batch, n_epoch,
+       mode, optim, etc. are declared directly in params/dynamic_params.
+
+    2. Structured base-learner configuration:
+       Base-learner-specific parameters are declared under:
+
+           params:
+             base_learner_configs:
+               AMLP:
+                 hidden_size: ...
+                 n_batch: ...
+                 n_epoch: ...
+
+       In this mode, this resolver only expands global LSE parameters
+       such as alpha, beta, Q_C, Q_RB_S, Q_RB_C and num_experts. The active
+       base-learner block is interpreted later by LSEnsemble itself.
+
+    Parameters
+    ----------
+    model_item : dict
+        One model block from the YAML configuration.
+    x_train : np.ndarray or None, optional
+        Training matrix. If provided, its number of columns is used as
+        ``input_size``.
+    y_train_lab : np.ndarray or None, optional
+        Training labels. If provided, the imbalance ratio is computed from
+        this array to resolve imbalance-dependent search modes.
+    logger : logging.Logger or None, optional
+        Logger instance.
+
+    Returns
+    -------
+    list
+        List of constructor-ready dictionaries for LSEnsemble.
+    """
+    logger = _get_resolver_logger(logger)
+
+    item = copy.deepcopy(model_item)
+
+    params = dict(item.get("params", {}))
+    dynamic_params = dict(item.get("dynamic_params", {}))
+    lse_optimization = dict(item.get("LSE_optimization", {}))
+    base_learner_params = dict(item.get("base_learner_params", {}))
+
+    lse_dynamic_aliases = {
+        "LS_alpha": "alpha",
+        "LS_beta": "beta",
+        "LS_Q_C": "Q_C",
+        "LS_Q_RB_S": "Q_RB_S",
+        "LS_Q_RB_C": "Q_RB_C",
+        "LS_num_experts": "num_experts",
+        "LS_hidden_size": "hidden_size",
+        "LS_drop_out": "drop_out",
+        "LS_n_batch": "n_batch",
+        "LS_n_epoch": "n_epoch",
+        "LS_mode": "mode",
+    }
+    for alias, canonical in lse_dynamic_aliases.items():
+        if alias in dynamic_params and canonical not in dynamic_params:
+            dynamic_params[canonical] = dynamic_params.pop(alias)
+
+    base_learner = params.get("base_learner", "FAMLP")
+    optim = params.get("optim", None)
+
+    # New hierarchical YAML format. When this is present, base-learner-specific
+    # parameters must not be injected as top-level LSEnsemble constructor
+    # arguments. They are resolved inside LSEnsemble from the selected block.
+    uses_structured_base_configs = "base_learner_configs" in params
+
+    if x_train is not None:
+        params["input_size"] = x_train.shape[1]
+
+    qp_tr = 1.0
+    if y_train_lab is not None:
+        qp_value = compute_imbalance_ratio(y_train_lab)
+        if qp_value is not None and np.isfinite(qp_value):
+            qp_tr = float(qp_value)
+
+    sw_optimization = lse_optimization.get("SW", False)
+    qc_optimization = lse_optimization.get("QC", False)
+    ri_c_optimization = lse_optimization.get("RI_C", False)
+    ri_p_optimization = lse_optimization.get("RI_P", False)
+
+    sw_mode = "disabled"
+    q_rb_c_mode = "disabled"
+    q_rb_s_mode = "disabled"
+
+    # ------------------------------------------------------------------
+    # Switching search space.
+    # YAML names: alpha, beta
+    # Constructor names: alpha, beta
+    # ------------------------------------------------------------------
+    if not sw_optimization:
+        dynamic_params["alpha"] = [0]
+        dynamic_params["beta"] = [0]
+    else:
+        alpha_values = dynamic_params.get("alpha", [])
+        if isinstance(alpha_values, list) and len(alpha_values) > 0:
+            dynamic_params["alpha"], sw_mode = _expand_lse_alpha_values(
+                alpha_values,
+                qp_tr
+            )
+        else:
+            dynamic_params["alpha"] = [0]
+
+        if "beta" not in dynamic_params:
+            dynamic_params["beta"] = [0]
+
+    # ------------------------------------------------------------------
+    # QC search space.
+    # YAML name: Q_C
+    # Constructor name: QC
+    # ------------------------------------------------------------------
+    if not qc_optimization:
+        dynamic_params["Q_C"] = [1]
+    elif "Q_C" not in dynamic_params:
+        dynamic_params["Q_C"] = [1]
+
+    # ------------------------------------------------------------------
+    # Cost rebalance search space.
+    # YAML/constructor names:
+    #   Q_RB_C -> Q_RB_C
+    # ------------------------------------------------------------------
+    if not ri_c_optimization:
+        dynamic_params["Q_RB_C"] = [1]
+    else:
+        q_rb_c_values = dynamic_params.get("Q_RB_C", [])
+        if isinstance(q_rb_c_values, list) and len(q_rb_c_values) > 0:
+            dynamic_params["Q_RB_C"], q_rb_c_mode = _expand_lse_rebalance_values(
+                q_rb_c_values,
+                "Q_RB_C",
+                qp_tr
+            )
+        else:
+            dynamic_params["Q_RB_C"] = [1]
+
+    # ------------------------------------------------------------------
+    # Sample/population rebalance search space.
+    # YAML/constructor names:
+    #   Q_RB_S -> Q_RB_S
+    # ------------------------------------------------------------------
+    if not ri_p_optimization:
+        dynamic_params["Q_RB_S"] = [1]
+    else:
+        q_rb_s_values = dynamic_params.get("Q_RB_S", [])
+        if isinstance(q_rb_s_values, list) and len(q_rb_s_values) > 0:
+            dynamic_params["Q_RB_S"], q_rb_s_mode = _expand_lse_rebalance_values(
+                q_rb_s_values,
+                "Q_RB_S",
+                qp_tr
+            )
+        else:
+            dynamic_params["Q_RB_S"] = [1]
+
+    # ------------------------------------------------------------------
+    # Defaults for missing dynamic parameters.
+    #
+    # In the structured YAML format, only global LSE parameters are filled here.
+    # Base-learner-specific defaults must not be injected at top level, because
+    # they would override or conflict with params.base_learner_configs.
+    #
+    # Legacy flat YAML remains supported by adding the old expert-specific
+    # defaults only when base_learner_configs is absent.
+    # ------------------------------------------------------------------
+    dynamic_defaults = {
+        "alpha": [0],
+        "beta": [0],
+        "Q_C": [1],
+        "Q_RB_S": [1],
+        "Q_RB_C": [1],
+        "num_experts": [1],
+    }
+
+    if not uses_structured_base_configs:
+        dynamic_defaults.update({
+            "hidden_size": [64],
+            "drop_out": [0.0],
+            "n_batch": [128],
+            "n_epoch": [100],
+            "mode": ["random"],
+        })
+
+    for key, default_value in dynamic_defaults.items():
+        if key not in dynamic_params:
+            dynamic_params[key] = default_value
+
+    # ------------------------------------------------------------------
+    # Filter dynamic search space.
+    #
+    # With structured base_learner_configs, dynamic_params is intentionally
+    # restricted to global LSE parameters. Expert-specific parameters are taken
+    # from the selected base_learner_configs block inside LSEnsemble.
+    #
+    # With legacy flat YAML, keep the historical filtering logic.
+    # ------------------------------------------------------------------
+    if uses_structured_base_configs:
+        allowed_dynamic_params = {
+            "alpha",
+            "beta",
+            "Q_C",
+            "Q_RB_S",
+            "Q_RB_C",
+            "num_experts",
+        }
+
+        dynamic_params = {
+            key: value
+            for key, value in dynamic_params.items()
+            if key in allowed_dynamic_params
+        }
+    else:
+        dynamic_params = _filter_lse_dynamic_params_by_base_learner(
+            dynamic_params=dynamic_params,
+            base_learner=base_learner,
+            optim=optim
+        )
+
+    keys = list(dynamic_params.keys())
+    values = list(dynamic_params.values())
+
+    resolved_configs = []
+
+    for combination in product(*values):
+        param_dict = dict(zip(keys, combination))
+        updated_config = dict(params)
+
+        # --------------------------------------------------------------
+        # Common LSE parameters.
+        # Note:
+        # - YAML uses Q_C
+        # - LSEnsemble constructor expects QC
+        # --------------------------------------------------------------
+        updated_config.update({
+            "alpha": param_dict["alpha"],
+            "beta": param_dict["beta"],
+            "QC": param_dict["Q_C"],
+            "Q_RB_S": param_dict["Q_RB_S"],
+            "Q_RB_C": param_dict["Q_RB_C"],
+            "num_experts": param_dict["num_experts"],
+        })
+
+        # --------------------------------------------------------------
+        # Base learner specific parameters.
+        #
+        # In the structured format, do not copy any expert-specific values
+        # to the top-level constructor config. The complete
+        # base_learner_configs block is already present in updated_config,
+        # and LSEnsemble will select the active sub-block internally.
+        #
+        # In the legacy flat format, preserve the previous behavior.
+        # --------------------------------------------------------------
+        if not uses_structured_base_configs:
+            if base_learner in ("FAMLP", "AMLP"):
+                updated_config.update({
+                    "hidden_size": param_dict["hidden_size"],
+                    "drop_out": param_dict["drop_out"],
+                    "n_batch": param_dict["n_batch"],
+                    "n_epoch": param_dict["n_epoch"],
+                })
+
+                if "activation_fn" in params:
+                    updated_config["activation_fn"] = params["activation_fn"]
+                if "optim" in params:
+                    updated_config["optim"] = params["optim"]
+                if "loss_fn" in params:
+                    updated_config["loss_fn"] = params["loss_fn"]
+
+                if "mode" in param_dict and optim != "lbfgs":
+                    updated_config["mode"] = param_dict["mode"]
+
+            elif base_learner == "Parzen":
+                updated_config.update({
+                    "hidden_size": param_dict["hidden_size"],
+                    "drop_out": param_dict["drop_out"],
+                    "n_batch": param_dict["n_batch"],
+                    "n_epoch": param_dict["n_epoch"],
+                })
+
+                if "activation_fn" in params:
+                    updated_config["activation_fn"] = params["activation_fn"]
+
+                if "mode" in param_dict:
+                    updated_config["mode"] = param_dict["mode"]
+
+            elif base_learner == "LogReg":
+                updated_config.update({
+                    "n_epoch": param_dict["n_epoch"],
+                })
+
+                if "optim" in params:
+                    updated_config["optim"] = params["optim"]
+
+                if "mode" in param_dict and optim != "lbfgs":
+                    updated_config["mode"] = param_dict["mode"]
+
+            elif base_learner == "CalibratedBooster":
+                if base_learner_params:
+                    updated_config["base_learner_params"] = dict(base_learner_params)
+
+                if "calibration_method" in params:
+                    updated_config["calibration_method"] = params["calibration_method"]
+
+            updated_config = _prune_lse_params_by_base_learner(
+                config=updated_config,
+                base_learner=base_learner,
+                optim=optim
+            )
+
+        else:
+            # Structured format:
+            # Keep backward-compatible base_learner_params only if explicitly
+            # provided. These flat params can still be used as final overrides
+            # inside LSEnsemble._resolve_base_learner_params().
+            if base_learner_params:
+                updated_config["base_learner_params"] = dict(base_learner_params)
+
+        updated_config = {
+            key: value
+            for key, value in updated_config.items()
+            if value is not None
+        }
+
+        resolved_configs.append(updated_config)
+
+    logger.debug(
+        "Resolved %d LSE configurations for model '%s' with base_learner='%s' "
+        "(structured_base_configs=%s, SW_mode=%s, Q_RB_C_mode=%s, "
+        "Q_RB_S_mode=%s, qp_tr=%.4f).",
+        len(resolved_configs),
+        item.get("name", "unknown"),
+        base_learner,
+        uses_structured_base_configs,
+        sw_mode,
+        q_rb_c_mode,
+        q_rb_s_mode,
+        qp_tr
+    )
+
+    return resolved_configs
+
+def _resolve_standard_model_configurations(model_item):
+    """
+    Resolve one non-LSE model block into constructor-ready configurations.
+
+    The resolver keeps all fixed parameters declared in ``params`` and combines
+    them with every combination declared in ``dynamic_params``. For current YAML
+    models, parameter names are used exactly as provided in the configuration.
+
+    Legacy compatibility is preserved only for a few old model families that may
+    still appear in historical experiments.
+
+    Parameters
+    ----------
+    model_item : dict
+        One model block from the YAML configuration.
+
+    Returns
+    -------
+    list
+        List of constructor-ready dictionaries.
+    """
+    item = copy.deepcopy(model_item)
+
+    model_name = item["name"]
+    fixed_params = dict(item.get("params", {}))
+    dynamic_params = dict(item.get("dynamic_params", {}))
+
+    if not dynamic_params:
+        return [
+            {
+                key: value
+                for key, value in fixed_params.items()
+                if value is not None
+            }
+        ]
+
+    keys = list(dynamic_params.keys())
+    values = list(dynamic_params.values())
+
+    resolved_configs = []
+
+    for combination in product(*values):
+        param_dict = dict(zip(keys, combination))
+
+        # Start from all fixed parameters and add all dynamic parameters
+        # exactly as they are declared in YAML.
+        updated_config = dict(fixed_params)
+        updated_config.update(param_dict)
+
+        # --------------------------------------------------------------
+        # Compatibility blocks for prefixed YAML names used in current and
+        # historical experiment files.
+        # --------------------------------------------------------------
+        param_aliases = {
+            "RF_n_estimators": "n_estimators",
+            "RF_max_depth": "max_depth",
+            "RF_min_samples_split": "min_samples_split",
+            "RF_min_samples_leaf": "min_samples_leaf",
+            "MLP_hidden_layer_sizes": "hidden_layer_sizes",
+            "MLP_activation": "activation",
+            "MLP_solver": "solver",
+            "MLP_alpha": "alpha",
+            "LGBM_num_leaves": "num_leaves",
+            "LGBM_learning_rate": "learning_rate",
+            "LGBM_n_estimators": "n_estimators",
+            "kNN_n_neighbors": "n_neighbors",
+            "kNN_metric": "metric",
+            "C45_max_depth": "max_depth",
+            "C45_min_samples_split": "min_samples_split",
+            "C45_min_samples_leaf": "min_samples_leaf",
+            "SVM_C": "C",
+            "SVM_gamma": "gamma",
+            "RB_n_estimators": "n_estimators",
+            "RB_base_estimator": "base_estimator",
+        }
+        for alias, canonical in param_aliases.items():
+            if alias in updated_config:
+                updated_config[canonical] = updated_config.pop(alias)
+
+        updated_config = {
+            key: value
+            for key, value in updated_config.items()
+            if value is not None
+        }
+
+        resolved_configs.append(updated_config)
+
+    return resolved_configs
+
+
+def resolve_model_configurations(model_block, x_train=None, y_train_lab=None, logger=None):
+    """
+    Resolve one model block from YAML into constructor-ready configurations.
+
+    Parameters
+    ----------
+    model_block : dict
+        One model block from the YAML configuration.
+    x_train : np.ndarray or None, optional
+        Training matrix. Used by LSE resolution when needed.
+    y_train_lab : np.ndarray or None, optional
+        Training labels. Used by LSE resolution when needed.
+    logger : logging.Logger or None, optional
+        Logger instance.
+
+    Returns
+    -------
+    list
+        List of resolved configurations.
+    """
+    model_name = model_block["name"]
+
+    if "LSEnsemble" in model_name:
+        return _resolve_lse_model_configurations(
+            model_item=model_block,
+            x_train=x_train,
+            y_train_lab=y_train_lab,
+            logger=logger
+        )
+
+    return _resolve_standard_model_configurations(model_block)
+
+
+def generate_model_configurations(model_list, x_train=None, y_train_lab=None, logger=None):
+    """
+    Generate resolved configurations for all models in the provided list.
+
+    This function preserves the historical public API used in the project,
+    but it now delegates the real resolution logic to
+    ``resolve_model_configurations``.
+
+    Parameters
+    ----------
+    model_list : list
+        List of model blocks from YAML.
+    x_train : np.ndarray or None, optional
+        Training matrix used by LSE resolution.
+    y_train_lab : np.ndarray or None, optional
+        Training labels used by LSE resolution.
+    logger : logging.Logger or None, optional
+        Logger instance.
+
+    Returns
+    -------
+    dict
+        Dictionary indexed by model name. Each value is a list of resolved
+        constructor-ready configurations.
+    """
+    cv_config = {}
 
     for model_item in model_list:
         model_name = model_item["name"]
-        param_grid = model_item["params"]
-        CV_config[model_name] = []
+        cv_config[model_name] = resolve_model_configurations(
+            model_block=model_item,
+            x_train=x_train,
+            y_train_lab=y_train_lab,
+            logger=logger
+        )
 
-        # LSEnsemble optimization logic
-        if 'LSEnsemble' in model_name:
-            SW_optimization = model_item['LSE_optimization']['SW']
-            QC_optimization = model_item['LSE_optimization']['QC']
-            RI_C_optimization = model_item['LSE_optimization']['RI_C']
-            RI_P_optimization = model_item['LSE_optimization']['RI_P']
-            
-            if not SW_optimization:
-                model_item["dynamic_params"]["LS_alpha"] = [0]
-                model_item["dynamic_params"]["LS_beta"] = [0]
-            else:
-                model_item['params']['SW_mode'] = "normal"
-                Alpha = model_item['dynamic_params']['LS_alpha']
-                Beta = model_item['dynamic_params']['LS_alpha']
-                Alpha_intervals = None  # Initialize Alpha_intervals
-                Beta_intervals = None  # Initialize Beta_intervals
-                if isinstance(Alpha, list) and len(Alpha) > 0:
-                    if Alpha[0] == "auto":
-                        if len(Alpha) > 1 and isinstance(Alpha[1], int) and Alpha[1] > 0:
-                            model_item['params']['SW_mode'] = "auto"
-                            Alpha_intervals = Alpha[1]
-                            model_item['dynamic_params']['LS_alpha']= list(range(1, Alpha_intervals + 1))
-                        else:
-                            print("Error in ALSE configuration: When Alpha[0] is 'auto', the next element must be a positive integer.")
-                            
-            if not QC_optimization:
-                model_item["dynamic_params"]["LS_Q_C"] = [1]
-                
-            if not RI_C_optimization:
-                model_item["dynamic_params"]["LS_Q_RB_C"] = [1]
-            else:
-                model_item['params']['Q_RB_C_mode'] = "normal"
-                Q_RB_C = model_item['dynamic_params']['LS_Q_RB_C']
-                Q_RB_C_intervals = None  # Initialize Q_RB_C_intervals
-                
-                if isinstance(Q_RB_C, list) and len(Q_RB_C) > 0:
-                    if Q_RB_C[0] == "auto":
-                        if len(Q_RB_C) > 1 and isinstance(Q_RB_C[1], int) and Q_RB_C[1] > 0:
-                            model_item['params']['Q_RB_C_mode'] = "auto"
-                            Q_RB_C_intervals = Q_RB_C[1]
-                            model_item['dynamic_params']['LS_Q_RB_C']= list(range(1, Q_RB_C_intervals + 1))
-                        else:
-                            print("Error in ALSE configuration: When Q_RB_C[0] is 'auto', the next element must be a positive integer.")
-                    elif Q_RB_C[0] == "full":
-                        model_item['params']['Q_RB_C_mode'] = "full"
-                        Q_RB_C_intervals = 1
-                    else:
-                        Q_RB_C_intervals = len(Q_RB_C)
-            if not RI_P_optimization:
-                model_item["dynamic_params"]["LS_Q_RB_S"] = [1]
-            else:
-                model_item['params']['Q_RB_S_mode'] = "normal"
-                Q_RB_S = model_item['dynamic_params']['LS_Q_RB_S']
-                Q_RB_S_intervals = None  # Initialize Q_RB_S_intervals
-                
-                if isinstance(Q_RB_S, list) and len(Q_RB_S) > 0:
-                    if Q_RB_S[0] == "auto":
-                        if len(Q_RB_S) > 1 and isinstance(Q_RB_S[1], int) and Q_RB_S[1] > 0:
-                            model_item['params']['Q_RB_S_mode'] = "auto"
-                            Q_RB_S_intervals = Q_RB_S[1]
-                            model_item['dynamic_params']['LS_Q_RB_S']= list(range(1, Q_RB_S_intervals + 1))
-                        else:
-                            print("Error in ALSE configuration: When Q_RB_S[0] is 'auto', the next element must be a positive integer.")
-                    elif Q_RB_S[0] == "full":
-                        model_item['params']['Q_RB_S_mode'] = "full"
-                        Q_RB_S_intervals = 1
-                    else:
-                        Q_RB_S_intervals = len(Q_RB_S)
-
-        dynamic_params = model_item["dynamic_params"]
-        keys = list(dynamic_params.keys())
-        values = list(dynamic_params.values())
-
-        for combination in product(*values):
-            updated_config = param_grid.copy()
-            param_dict = dict(zip(keys, combination))
-
-            if model_name == "MLPBayesBinW":
-                updated_config.update({
-                    "layers_size": (param_dict['s_NnBase'],),
-                    "drop_out": [param_dict['s_pDOent'], param_dict['s_pDOocu']],
-                    "activations": [param_dict['s_tActBase'], param_dict['s_tActSalida']],
-                    "n_epoch": param_dict['s_nEpoch'],
-                    "n_batch": param_dict['s_nBatch'],
-                })
-            elif model_name == "LGBMClassifier":
-                updated_config.update({
-                    "num_leaves": param_dict['LGBM_num_leaves'],
-                    "learning_rate": param_dict['LGBM_learning_rate'],
-                    "n_estimators": param_dict['LGBM_n_estimators'],
-                })
-            elif 'LSEnsemble' in model_name:
-                updated_config.update({
-                    "alpha": param_dict['LS_alpha'],
-                    "beta": param_dict['LS_beta'],
-                    "QC": param_dict['LS_Q_C'],
-                    "Q_RB_S": param_dict['LS_Q_RB_S'],
-                    "Q_RB_C": param_dict['LS_Q_RB_C'],
-                    "num_experts": param_dict['LS_num_experts'],
-                    "hidden_size": param_dict['LS_hidden_size'],
-                    "drop_out": param_dict['LS_drop_out'],
-                    "n_batch": param_dict['LS_n_batch'],
-                    "n_epoch": param_dict['LS_n_epoch'],
-                    "mode": param_dict['LS_mode'],
-                })
-            elif model_name == "LogisticRegression":
-                updated_config.update({
-                    "C": param_dict['LR_C'],
-                    "penalty": param_dict['LR_penalty'],
-                })
-            elif model_name == "RandomForestClassifier":
-                updated_config.update({
-                    "n_estimators": param_dict['RF_n_estimators'],
-                    "max_depth": param_dict['RF_max_depth'],
-                    "min_samples_split": param_dict['RF_min_samples_split'],
-                    "min_samples_leaf": param_dict['RF_min_samples_leaf'],
-                })
-            elif model_name == "MLPClassifier":
-                updated_config.update({
-                    "hidden_layer_sizes": param_dict['MLP_hidden_layer_sizes'],
-                    "activation": param_dict['MLP_activation'],
-                    "solver": param_dict['MLP_solver'],
-                    "alpha": param_dict['MLP_alpha'],
-                })
-            elif model_name == "kNN":
-                updated_config.update({
-                    "n_neighbors": param_dict['kNN_n_neighbors'],
-                    "metric": param_dict['kNN_metric'],
-                })
-            elif model_name == "C4.5":
-                updated_config.update({
-                    "max_depth": param_dict['C45_max_depth'],
-                    "min_samples_split": param_dict['C45_min_samples_split'],
-                    "min_samples_leaf": param_dict['C45_min_samples_leaf'],
-                })
-            elif model_name == "SVM":
-                updated_config.update({
-                    "C": param_dict['SVM_C'],
-                    "gamma": param_dict['SVM_gamma'],
-                })
-            elif model_name == "MultiRandBal":
-                updated_config.update({
-                    "n_estimators": param_dict['RB_n_estimators'],
-                    "base_estimator": param_dict['RB_base_estimator'],
-                })
-                
-            CV_config[model_name].append(updated_config)
-
-    return CV_config
+    return cv_config
 
 def initialize_model_data(model_list, dynamic_combinations, num_dichotomies, num_folds, n_simus, logger):
     """Initializes data structures for models."""
@@ -536,7 +1238,7 @@ def estimate_alpha(ir: float, cap: bool = True) -> float:
     if ir <= 1.0:
         return 0.08  # Minimum reasonable value for nearly balanced cases
     
-    alpha_est = 0.12 * np.log10(ir) + 0.08
+    alpha_est = 0.2 * np.log10(ir) + 0.1
     
     if cap:
         alpha_est = min(alpha_est, 0.45)

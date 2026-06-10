@@ -20,19 +20,19 @@ For further details on likelihood ratio estimation and Bayes threshold transform
     * It systematically explores different configurations of model parameters.
     * It evaluates the performance of each configuration using cross-validation or a similar technique.
     * The script saves the best-performing model configurations (parameters) for later use in the evaluation phase.
-    * It is driven by the configurations specified in the `config.yaml` file, including the models to optimize and the ranges of their hyperparameters.
+    * It is driven by the configurations specified in the `config/config.yaml` file, including the models to optimize and the ranges of their hyperparameters.
 * **Binarization Decomposition:**
     * Implements binarization matrices for effective multiclass to binary transformation.
-    * Offers flexible One-versus-One (OvO), OvR, and ECOC encoding options (complete, dense, sparse) configurable via `config.yaml`.
+    * Offers flexible One-versus-One (OvO), OvR, and ECOC encoding options (complete, dense, sparse) configurable via `config/config.yaml`.
 * **ALS Ensemble Algorithm:**
     * A specialized ensemble algorithm designed for label switching correction, enhancing model robustness.
-    * Provides configurable optimization parameters for the ALS Ensemble via `config.yaml`.
+    * Provides configurable optimization parameters for the ALS Ensemble via `config/config.yaml`.
 * **Comprehensive Evaluation:**
     * Includes a thorough evaluation suite using key multiclass metrics: balanced accuracy, Cohen's kappa, geometric mean, and sensitivity.
     * Features detailed logging and output to facilitate performance analysis.
 * **Configuration-Driven Design:**
-    * Leverages `config.yaml` for easy customization of datasets, models, and evaluation settings.
-    * Employs streamlined model selection logic based on peak or average performance, configurable through `config.yaml`.
+    * Leverages `config/config.yaml` for easy customization of datasets, models, and evaluation settings.
+    * Employs streamlined model selection logic based on peak or average performance, configurable through `config/config.yaml`.
 * **Model Persistence:**
     * Saves models configured with optimized hyperparameters, along with their configurations, using pickle for efficient testing and deployment.
     * Utilizes a naming convention for saved models that includes the parameters used for the ALS Ensemble.
@@ -41,7 +41,7 @@ For further details on likelihood ratio estimation and Bayes threshold transform
     * It loads the best model configurations (parameters) saved during the optimization phase by `optimize_hyperparameters.py`.
     * Subsequently, it instantiates and trains the models using these optimal configurations.
     * The script concludes by performing testing on a separate dataset to obtain the final performance metrics.
-    * It relies on the `config.yaml` file to load necessary parameters and instantiate the model architecture based on the stored configurations.
+    * It relies on the `config/config.yaml` file to load necessary parameters and instantiate the model architecture based on the stored configurations.
 * **Dataset Flexibility:**
     * Engineered to accommodate a wide range of datasets stored within a designated data folder.
 
@@ -54,9 +54,9 @@ For further details on likelihood ratio estimation and Bayes threshold transform
     cd MC_Label_Switching
     ```
 
-2.  **Configure `config.yaml`:**
+2.  **Configure `config/config.yaml`:**
 
-    * Open the `config.yaml` file and adjust settings for datasets, models, optimization parameters, evaluation metrics, and other project configurations as needed.
+    * Open the `config/config.yaml` file and adjust settings for datasets, models, optimization parameters, evaluation metrics, and other project configurations as needed.
 
 3.  **Run the hyperparameter optimization script:**
 
@@ -89,7 +89,7 @@ For further details on likelihood ratio estimation and Bayes threshold transform
 
 ## Datasets
 
-* Place your datasets in the `datasets` folder (or specify the path in `config.yaml`).
+* Place your datasets in the `datasets` folder (or specify the path in `config/config.yaml`).
 
 ## Output
 

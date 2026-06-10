@@ -1,1 +1,28 @@
 .DS_Store
+
+# Local OS/cache files
+.DS_Store
+__pycache__/
+*.pyc
+
+# Local experiment outputs and generated artifacts
+results/
+results*/
+*.pkl
+*.pickle
+*.joblib
+*.pt
+*.pth
+*.h5
+*.onnx
+*.npy
+*.npz
+*.csv
+*.xlsx
+*.log
+*.out
+*.pdf
+*.docx
+libraries/cached_matrices/
+datasets/generated/
+datasets/generated*/
