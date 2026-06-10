@@ -13,6 +13,7 @@ Key features:
 import os
 import pickle
 import time
+import argparse
 import numpy as np
 import pandas as pd
 
@@ -38,8 +39,18 @@ from sklearn.exceptions import ConvergenceWarning
 # Suppress ConvergenceWarnings for cleaner output
 warnings.filterwarnings("ignore", category=ConvergenceWarning)
 
+parser = argparse.ArgumentParser(
+    description="Evaluate final multiclass performance from optimized binary configurations."
+)
+parser.add_argument(
+    "--config",
+    default="config/config_test.yaml",
+    help="Path to the YAML configuration file."
+)
+args = parser.parse_args()
+
 # Load Configuration
-config = load_config('config_test.yaml')
+config = load_config(args.config)
 
 # Setup Logger
 logger = setup_logger(config)
@@ -47,7 +58,7 @@ logger = setup_logger(config)
 # Common Parameters
 
 data_path = config["paths"]["data_folder"]
-force_results = config["simulation"]["force_results"]
+force_results = config.get("simulation", {}).get("force_results", False)
 Test_size = config["simulation"]["test_size"]
 N_max = config["simulation"]["N_MAX"]
 n_simus = config["simulation"]["n_simus"]
@@ -61,8 +72,7 @@ output_path = config["paths"]["output_folder"]
 model_list = config["models"]
 
 # COMMENTS FOR SAFE SELECTION:
-# Current YAML models include RandomForestClassifier, LSEnsemble,
-# MLPClassifier, LGBMClassifier, kNN, and SVM.
+# Select models by name so the script does not depend on YAML ordering.
 
 # Examples of selection (uncomment the desired line):
 
@@ -75,8 +85,7 @@ model_list = config["models"]
 # 3. Comparison between ALSE and classical baselines (example: RF + LightGBM + SVM + MLP)
 
 # 4. Run only baselines without ALSE (for ablation or clean comparison)
-# model_list = [config["models"][i] for i in [0, 1, 3, 4, 5, 6, 7, 8]]
-# del model_list[2]  # Example of exclusion if using the full list
+# model_list = [m for m in config["models"] if "LSEnsemble" not in m["name"]]
 
 # Apply the desired selection here (uncomment only one option)
 # model_list = config["models"]  # All models
@@ -147,11 +156,12 @@ for dataset_name, (X, y, C0) in datasets.items():
         
         model_class = get_class_from_string(model_item['class'])
         
-        if model_name == 'LSEnsemble':
-            SW_optimization = model_item['LSE_optimization']['SW']
-            QC_optimization = model_item['LSE_optimization']['QC']
-            RI_C_optimization = model_item['LSE_optimization']['RI_C']
-            RI_P_optimization = model_item['LSE_optimization']['RI_P']
+        if 'LSEnsemble' in model_name:
+            lse_optimization = model_item.get("LSE_optimization", {})
+            SW_optimization = bool(lse_optimization.get("SW", False))
+            QC_optimization = bool(lse_optimization.get("QC", False))
+            RI_C_optimization = bool(lse_optimization.get("RI_C", False))
+            RI_P_optimization = bool(lse_optimization.get("RI_P", False))
             logger.info(f'    Switching: {int(SW_optimization)}, QC: {int(QC_optimization)}, Cost: {int(RI_C_optimization)}, Population: {int(RI_P_optimization)}')
 
             filename_i = f"{dataset_name}_{ECOC_enc}_{model_name}_SW_{int(SW_optimization)}_QC_{int(QC_optimization)}_RIC_{int(RI_C_optimization)}_RIP_{int(RI_P_optimization)}_train.pkl"
@@ -211,7 +221,6 @@ for dataset_name, (X, y, C0) in datasets.items():
         f1_simulations = []
         runtime_simulations = [] # New list for time tracking
 
-        n_simus = max(n_simus, 20) 
         for k_simu in range(n_simus):  
             # Start timer for this simulation (Train + Test)
             start_time = time.time()

@@ -26,8 +26,8 @@ models:
   #
   # Purpose:
   #   Minimal execution test for the new shared LSEnsemble configuration
-  #   resolver. This file intentionally uses the structured SOCTRA-style
-  #   syntax, but without any SOCTRA-specific concepts.
+  #   resolver. This file intentionally uses the structured shared LSEnsemble-style
+  #   syntax, but without any project-specific concepts.
   #
   # Expected size:
   #   One model, one global LSE configuration, three experts, one simulation.
@@ -41,7 +41,7 @@ models:
       base_learner: AMLP
 
       # Base-learner-specific configuration.
-      # This follows the structured SOCTRA-style layout.
+      # This follows the structured shared LSEnsemble-style layout.
       base_learner_configs:
         AMLP:
           hidden_size: 4
