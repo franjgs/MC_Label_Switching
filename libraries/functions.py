@@ -115,6 +115,19 @@ def _get_resolver_logger(logger=None):
     return logger if logger is not None else logging.getLogger(__name__)
 
 
+def get_enabled_models(model_list):
+    """
+    Return only enabled model blocks from a YAML model list.
+
+    Missing 'enabled' is treated as True for backward compatibility with
+    older configuration files.
+    """
+    return [
+        model_item
+        for model_item in model_list
+        if bool(model_item.get("enabled", True))
+    ]
+
 def _normalize_legacy_dynamic_param_names(dynamic_params):
     """
     Normalize legacy prefixed dynamic parameter names to constructor-ready names.

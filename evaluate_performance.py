@@ -34,17 +34,25 @@ from libraries.imbalance_degree import imbalance_degree
 from libraries.functions import compute_imbalance_ratio
 from libraries.functions import apply_ecoc_binarization
 
+from libraries.functions import get_enabled_models
+
 import warnings
 from sklearn.exceptions import ConvergenceWarning
 # Suppress ConvergenceWarnings for cleaner output
 warnings.filterwarnings("ignore", category=ConvergenceWarning)
 
+DEFAULT_CONFIG_PATH = "config/config_smoke.yaml"
+
+# Transition note:
+# config_smoke.yaml is currently used as the validated structured
+# LSEnsemble configuration while config_train.yaml is migrated.
+
 parser = argparse.ArgumentParser(
-    description="Evaluate final multiclass performance from optimized binary configurations."
+    description="Optimize hyperparameters for binary-decomposition multiclass experiments."
 )
 parser.add_argument(
     "--config",
-    default="config/config_test.yaml",
+    default=DEFAULT_CONFIG_PATH,
     help="Path to the YAML configuration file."
 )
 args = parser.parse_args()
@@ -68,30 +76,14 @@ maj_min = config["simulation"]["maj_min"]
 min_maj = config["simulation"]["min_maj"]
 output_path = config["paths"]["output_folder"]
 
-# Model Configuration - Full list of available models
-model_list = config["models"]
+model_list = get_enabled_models(config["models"])
 
-# COMMENTS FOR SAFE SELECTION:
-# Select models by name so the script does not depend on YAML ordering.
-
-# Examples of selection (uncomment the desired line):
-
-# 1. Run ALL models (default configuration)
-# model_list = config["models"]
-
-# 2. Run only our main method (LSEnsemble / ALSE)
-# model_list = [m for m in config["models"] if m["name"] == "LSEnsemble"] # Only ALSE
-
-# 3. Comparison between ALSE and classical baselines (example: RF + LightGBM + SVM + MLP)
-
-# 4. Run only baselines without ALSE (for ablation or clean comparison)
-# model_list = [m for m in config["models"] if "LSEnsemble" not in m["name"]]
-
-# Apply the desired selection here (uncomment only one option)
-# model_list = config["models"]  # All models
-# model_list = [m for m in config["models"] if m["name"] in {"RandomForestClassifier", "LGBMClassifier", "SVM", "MLPClassifier"}]
-model_list = [m for m in config["models"] if m["name"] == "LSEnsemble"] # Only ALSE
-
+if not model_list:
+    logger.warning("No enabled models found in the configuration.")
+logger.info(
+    "Enabled models: %s",
+    ", ".join(model_item["name"] for model_item in model_list)
+)
 
 # Load Datasets
 dataset_special_cases = {}

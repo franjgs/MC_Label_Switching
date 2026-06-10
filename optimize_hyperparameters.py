@@ -35,6 +35,9 @@ from libraries.functions import generate_model_configurations, apply_ecoc_binari
 from libraries.functions import compute_imbalance_ratio
 from libraries.imbalance_degree import imbalance_degree
 
+from libraries.functions import get_enabled_models
+
+
 # Suppress ConvergenceWarnings
 warnings.filterwarnings("ignore", category=ConvergenceWarning)
 
@@ -87,29 +90,15 @@ if metric_function_name not in METRIC_FUNCTIONS:
 f_sel = METRIC_FUNCTIONS[metric_function_name]
 model_selection = config["simulation"]["model_selection"]
 
-# Model Configuration - Full list of available models
-model_list = config["models"]
+model_list = get_enabled_models(config["models"])
 
-# COMMENTS FOR SAFE SELECTION:
-# Select models by name so the script does not depend on YAML ordering.
+if not model_list:
+    logger.warning("No enabled models found in the configuration.")
+logger.info(
+    "Enabled models: %s",
+    ", ".join(model_item["name"] for model_item in model_list)
+)
 
-# Examples of selection (uncomment the desired line):
-
-# 1. Run ALL models (default configuration)
-# model_list = config["models"]
-
-# 2. Run only our main method (LSEnsemble / ALSE)
-# model_list = [m for m in config["models"] if m["name"] == "LSEnsemble"]
-
-# 3. Comparison between ALSE and classical baselines (example: RF + LightGBM + SVM + MLP)
-# model_list = [m for m in config["models"] if m["name"] in {"RandomForestClassifier", "LGBMClassifier", "SVM", "MLPClassifier"}]
-
-# 4. Run only baselines without ALSE (for ablation or clean comparison)
-# model_list = [m for m in config["models"] if "LSEnsemble" not in m["name"]]
-
-# Apply the desired selection here (uncomment only one option)
-# model_list = config["models"]  # All models
-model_list = [m for m in config["models"] if m["name"] == "LSEnsemble"]
 
 # Generate Model Configurations
 CV_config = generate_model_configurations(model_list)

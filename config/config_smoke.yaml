@@ -6,7 +6,7 @@ logging:
 simulation:
   verbose: true
   f_sel: balanced_accuracy_score
-  ecoc_enc: OVA
+  ecoc_enc: complete
   flg_swp: true
   maj_min: false
   min_maj: false
@@ -34,7 +34,7 @@ models:
   #   One model, one global LSE configuration, three experts, one simulation.
   # ------------------------------------------------------------------
   - name: LSEnsemble
-    enabled: true
+    enabled: false
     class: libraries.labelswitching.LSEnsemble
 
     params:
@@ -92,3 +92,40 @@ models:
 
       # Ensemble structure.
       num_experts: [11]
+
+  - name: MLPClassifier
+    enabled: true
+    class: sklearn.neural_network.MLPClassifier
+    params:
+      max_iter: 500
+      random_state: 42
+      tol: 0.0001
+    dynamic_params:
+      MLP_hidden_layer_sizes: [[20], [40], [60]]
+      MLP_activation: ["relu", "tanh", "logistic"]
+      MLP_solver: ["adam"]
+      MLP_alpha: [0.0001, 0.001]
+
+  - name: LGBMClassifier
+    enabled: true
+    class: lightgbm.LGBMClassifier
+    params:
+      boosting_type: gbdt
+      max_depth: -1
+      force_col_wise: true
+      verbosity: -1
+      is_unbalance: true
+    dynamic_params:
+      LGBM_num_leaves: [31]
+      LGBM_learning_rate: [0.1, 0.05]
+      LGBM_n_estimators: [20, 40, 60]
+      
+  - name: SVM
+    enabled: true
+    class: sklearn.svm.SVC
+    params:
+      kernel: rbf
+      probability: true  # Enables probability estimation
+    dynamic_params:
+      SVM_C: [0.1, 1, 10, 100]  # Regularization parameter
+      SVM_gamma: [scale, 0.1, 1]  # Kernel coefficient
