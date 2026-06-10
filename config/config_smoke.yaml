@@ -1,0 +1,74 @@
+logging:
+  level: INFO
+  format: "%(asctime)-15s %(levelname)-8s %(message)s"
+  datefmt: "%Y-%m-%d %H:%M:%S"
+
+simulation:
+  verbose: true
+  f_sel: balanced_accuracy_score
+  ecoc_enc: OVA
+  flg_swp: true
+  maj_min: false
+  min_maj: false
+  n_simus: 1
+  test_size: 25
+  N_MAX: 500
+  num_folds: 1
+  model_selection: avg
+
+paths:
+  data_folder: datasets_lowC_complete
+  output_folder: results_smoke
+
+models:
+  # ------------------------------------------------------------------
+  # Smoke test - LSEnsemble / AMLP / structured configuration
+  #
+  # Purpose:
+  #   Minimal execution test for the new shared LSEnsemble configuration
+  #   resolver. This file intentionally uses the structured SOCTRA-style
+  #   syntax, but without any SOCTRA-specific concepts.
+  #
+  # Expected size:
+  #   One model, one global LSE configuration, three experts, one simulation.
+  # ------------------------------------------------------------------
+  - name: LSEnsemble
+    enabled: true
+    class: libraries.labelswitching.LSEnsemble
+
+    params:
+      # Base learner used as expert inside the Label Switching Ensemble.
+      base_learner: AMLP
+
+      # Base-learner-specific configuration.
+      # This follows the structured SOCTRA-style layout.
+      base_learner_configs:
+        AMLP:
+          hidden_size: 4
+          activation_fn: tanh
+          output_act: 1
+          drop_out: 0.0
+
+          optim: lbfgs
+          loss_fn: MSE
+          n_epoch: 1
+          n_batch: auto
+          mode: random
+
+          early_stopping: false
+          lbfgs_max_iter: 80
+          lbfgs_max_eval: 100
+
+    LSE_optimization:
+      SW: true
+      QC: false
+      RI_C: false
+      RI_P: false
+
+    dynamic_params:
+      alpha: [0.1]
+      beta: [0.0]
+      Q_C: [1]
+      Q_RB_S: [1]
+      Q_RB_C: [1]
+      num_experts: [3]
