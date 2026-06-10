@@ -626,7 +626,7 @@ class LSEnsemble(nn.Module):
         Q_tr = self.QC * self.QP_tr
         
         Q_RB_C = min(1, self.Q_RB_C) # self.Q_RB_C # 
-        Q_RB_S = min(1, self.Q_RB_S) # self.Q_RB_S #
+        Q_RB_S = min(1, self.Q_RB_S) # self.Q_RB_S # 
         
         QR_tr = max(1, QP_tr / (Q_RB_C * Q_RB_S))
         Q_ratio = (Q_tr / (Q_tr + QR_tr)) # 1/2 # 

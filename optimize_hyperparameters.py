@@ -103,8 +103,8 @@ model_list = config["models"]
 
 # Apply the desired selection here (uncomment only one option)
 # model_list = config["models"]  # All models
-model_list = [config["models"][i] for i in [1, 7, 3]]
-# model_list = [config["models"][2]] # Only ALSE
+# model_list = [config["models"][i] for i in [1, 7, 3]]
+model_list = [config["models"][2]] # Only ALSE
 # model_list = [config["models"][7], config["models"][3]] 
 # model_list = [config["models"][i] for i in [4, 2, 9]]
 # model_list = [config["models"][9]] # Only ALSE Cal
@@ -326,8 +326,8 @@ for dataset_name, (X, y, C0) in datasets.items():
                                 alpha_start = estimate_alpha(QP_tr[j_dic])
                                 n_items = len(model_item['dynamic_params'].get('LS_alpha', []))
                                 if n_items > 0:
-                                    model_item['dynamic_params']['LS_alpha'] = np.round(np.linspace(max(0.0, alpha_start - 0.10),
-                                                                                                    min(0.45, alpha_start + 0.12), n_items), 3).tolist() 
+                                    model_item['dynamic_params']['LS_alpha'] = np.round(np.linspace(max(0.0, alpha_start - 0.1),
+                                                                                                    min(0.45, alpha_start + 0.2), n_items), 3).tolist() 
                                 
                         CV_config[model_name] = []  # Reset to avoid accumulating old configs
                         params = model_item['params']

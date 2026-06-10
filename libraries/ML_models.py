@@ -136,6 +136,118 @@ class MLPClassifierTorch(nn.Module):
 # ---------------------------------------------
 # PyTorch implementation of a custom LogReg
 # ---------------------------------------------
+class LogisticRegressionTorch_old(nn.Module):
+    """
+    Custom Logistic Regression with asymmetric activation, 
+    compatible with MLPClassifierTorch API.
+    """
+    def __init__(self, input_dim, alpha, beta, alpha_tr=0.0001, batch_size='auto', 
+                 learning_rate_init=0.01, max_iter=100, solver='adam'):
+        super(LogisticRegressionTorch, self).__init__()
+        self.linear = nn.Linear(input_dim, 1)
+        self.alpha = alpha
+        self.beta = beta
+        self.alpha_tr = alpha_tr
+        self.batch_size = batch_size
+        self.learning_rate_init = learning_rate_init
+        self.max_iter = max_iter
+        self.solver = solver
+
+        # Optimizer initialization
+        if solver == 'adam':
+            self.optimizer = optim.Adam(self.parameters(), lr=self.learning_rate_init, weight_decay=self.alpha_tr)
+        elif solver == 'lbfgs':
+            self.optimizer = optim.LBFGS(self.parameters(), lr=self.learning_rate_init)
+        else:
+            raise ValueError("Only 'adam' and 'lbfgs' are supported.")
+
+    def forward(self, x):
+        """Asymmetric tanh transformation."""
+        z = self.linear(x)
+        return torch.where(
+            z < 0,
+            torch.tanh(z) * (1 - 2 * self.alpha),
+            torch.tanh(z) * (1 - 2 * self.beta)
+        )
+
+    def fit(self, X, y, sample_weight=None):
+        """
+        Unified fit method supporting mini-batches, sample weights, and L-BFGS.
+        """
+        # Convert inputs to tensors
+        X_tensor = torch.tensor(X, dtype=torch.float32)
+        y_tensor = torch.tensor(y, dtype=torch.float32).unsqueeze(1)
+        
+        # Handle sample weights (Weighted MSE)
+        if sample_weight is not None:
+            weights = torch.tensor(sample_weight, dtype=torch.float32).unsqueeze(1)
+        else:
+            weights = torch.ones_like(y_tensor)
+
+        # DataLoader setup
+        batch_sz = len(X_tensor) if self.batch_size == 'auto' else self.batch_size
+        dataset = torch.utils.data.TensorDataset(X_tensor, y_tensor, weights)
+        dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_sz, shuffle=True)
+
+        self.train()
+        for epoch in range(self.max_iter):
+            for batch_X, batch_y, batch_w in dataloader:
+                def closure():
+                    self.optimizer.zero_grad()
+                    outputs = self.forward(batch_X)
+                    # Manual weighted MSE: (w * (out - target)^2).mean()
+                    loss = (batch_w * (outputs - batch_y)**2).mean()
+                    loss.backward()
+                    return loss
+
+                if self.solver == 'adam':
+                    closure()
+                    self.optimizer.step()
+                elif self.solver == 'lbfgs':
+                    self.optimizer.step(closure)
+        
+        self._is_fitted = True
+        return self
+
+    def predict(self, X):
+        """
+        Predict class labels for X. Required for sklearn compatibility.
+        
+        Args:
+            X (ndarray): Input features.
+        Returns:
+            ndarray: Binary predictions (0 or 1).
+        """
+        self.eval() # Set model to evaluation mode
+        with torch.no_grad():
+            X_tensor = torch.tensor(X, dtype=torch.float32)
+            outputs = self.forward(X_tensor)
+            # Assuming threshold 0 for tanh-based output
+            return (outputs > 0).float().numpy().flatten()
+
+    def predict_proba(self, X):
+        """
+        Predict class probabilities for X. Required for CalibratedClassifierCV.
+        
+        Args:
+            X (ndarray): Input features.
+        Returns:
+            ndarray: Array of shape (n_samples, 2) with class probabilities.
+        """
+        self.eval()
+        with torch.no_grad():
+            X_tensor = torch.tensor(X, dtype=torch.float32)
+            outputs = self.forward(X_tensor)
+            
+            # Map asymmetric output to a [0, 1] probability range
+            # Note: Since outputs can be slightly outside [-1, 1] depending on alpha/beta,
+            # we clamp the values to ensure valid probabilities.
+            prob_pos = (outputs + 1) / 2
+            prob_pos = torch.clamp(prob_pos, 0, 1).numpy().reshape(-1, 1)
+            
+            # Return [P(class 0), P(class 1)]
+            return np.hstack([1 - prob_pos, prob_pos])
+        
 class LogisticRegressionTorch(nn.Module):
     """
     Custom Logistic Regression compatible with external training routines.
@@ -355,6 +467,7 @@ class CalibratedBooster(nn.Module):
             }
 
             if self.model_type == 'lgbm':
+                
                 base.update({
                     'boosting_type': 'gbdt',
                     'objective': 'binary' if self.task == 'classification' else 'regression',
@@ -373,6 +486,7 @@ class CalibratedBooster(nn.Module):
                     'reg_alpha': 0.0,
                     'reg_lambda': 0.0,
                     # Imbalance handling
+                    # 'is_unbalance': True if self.task == 'classification' else False,
                     'is_unbalance': True if self.task == 'classification' else False,
                 })
 

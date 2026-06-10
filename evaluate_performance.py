@@ -15,7 +15,6 @@ import pickle
 import time
 import numpy as np
 import pandas as pd
-import torch
 
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
@@ -71,23 +70,27 @@ model_list = config["models"]
 # - C4.5: index 6 – Decision tree with entropy criterion (C4.5 approximation)
 # - SVM: index 7 – Support Vector Machine with RBF kernel
 # - MultiRandBal: index 8 – Ensemble with SMOTE oversampling + random undersampling
-# - LSEnsemble Calibrated: index 9 – ALSE Calibrated 
 
 # Examples of selection (uncomment the desired line):
+
 # 1. Run ALL models (default configuration)
 # model_list = config["models"]
+
 # 2. Run only our main method (LSEnsemble / ALSE)
 # model_list = [config["models"][2]] # Only ALSE
+
 # 3. Comparison between ALSE and classical baselines (example: RF + LightGBM + SVM + MLP)
 # model_list = [config["models"][i] for i in [1, 4, 7, 3]]
+
 # 4. Run only baselines without ALSE (for ablation or clean comparison)
 # model_list = [config["models"][i] for i in [0, 1, 3, 4, 5, 6, 7, 8]]
 # del model_list[2]  # Example of exclusion if using the full list
 
 # Apply the desired selection here (uncomment only one option)
 # model_list = config["models"]  # All models
-model_list = [config["models"][i] for i in [1, 4, 7, 3]]
+# model_list = [config["models"][i] for i in [1, 4, 7, 3]]
 model_list = [config["models"][2]] # Only ALSE
+
 
 # Load Datasets
 dataset_special_cases = {}
@@ -95,12 +98,8 @@ datasets = load_datasets(data_path, N_max, dataset_special_cases)
 
 # Process Datasets
 for dataset_name, (X, y, C0) in datasets.items():
-    n_samples, n_attributes = X.shape
+    
     nclass = np.unique(y).shape[0]
-    logger.info('Multiclass Results')
-    logger.info('---------------------------------------------------------------------')
-    logger.info(f'Dataset: {dataset_name}.')
-    logger.info(f'Number of classes: {nclass}. Number of samples: {n_samples}. Dimensionality: {n_attributes}')
 
     if nclass > 2:
         if maj_min:
@@ -112,26 +111,30 @@ for dataset_name, (X, y, C0) in datasets.items():
         else:
             class_dict = {k + 1: k + 1 for k in range(nclass)}
         y = np.vectorize(class_dict.get)(y)
-        IB_degree = imbalance_degree(y, "EU")
-        
+    
         class_labels = np.array(sorted(class_dict.keys()))
+    
         M_ecoc = ECOC(encoding=ECOC_enc, labels=class_labels)
         M = (M_ecoc._code_matrix > 0).astype(int)
+    
         if True:
             M[M == 1] = -C0
             M[M == 0] = C0
+    
         M_ecoc._code_matrix = M
+        IB_degree = imbalance_degree(y, "EU")
+        
     elif nclass == 2:
         if np.sum(y == -1) < np.sum(y == 1):
             y = -y  # Ensure -1 is majority
-        IB_degree = compute_imbalance_ratio(y)
-        
+
         class_labels = np.unique(y)
         M_ecoc = ECOC(encoding=ECOC_enc, labels=class_labels)
         M = (M_ecoc._code_matrix > 0).astype(int)
         M[M == 1] = -C0
         M[M == 0] = C0
         M_ecoc._code_matrix = M
+        IB_degree = compute_imbalance_ratio(y)
         
         label_map_binary = {-1: 1, 1: 2}
         y_converted = np.array([label_map_binary[label] for label in y])
@@ -139,8 +142,12 @@ for dataset_name, (X, y, C0) in datasets.items():
 
     num_dichotomies = M_ecoc._code_matrix.shape[1]
 
+    logger.info('Multiclass Results')
+    logger.info('---------------------------------------------')
+    logger.info(f'Dataset: {dataset_name}. Imbalance Degree = {IB_degree:.2f}')
     logger.info(f'ECOC encoding: {M_ecoc.encoding}. Flag swap: {flg_swp}')
-    logger.info(f'Number of Dichotomies: {num_dichotomies}. Imbalance Degree = {IB_degree:.2f}')
+    logger.info(f'Classes: {nclass}. Dichotomies: {num_dichotomies}')
+    logger.info('---------------------------------------------')
 
     for model_item in model_list:
         model_name = model_item["name"]
@@ -148,7 +155,7 @@ for dataset_name, (X, y, C0) in datasets.items():
         
         model_class = get_class_from_string(model_item['class'])
         
-        if 'LSEnsemble' in model_name:
+        if model_name == 'LSEnsemble':
             SW_optimization = model_item['LSE_optimization']['SW']
             QC_optimization = model_item['LSE_optimization']['QC']
             RI_C_optimization = model_item['LSE_optimization']['RI_C']
@@ -183,10 +190,11 @@ for dataset_name, (X, y, C0) in datasets.items():
             "Test_size": Test_size
         }
         
-        # Update if it doesn't exist or is empty.
+        # Solo actualizamos si no existe o está vacío
         for key, value in updates.items():
             if key not in result_data or result_data[key] is None:
                 result_data[key] = value
+
                                 
         # Check if execution time was already computed
         # We consider it "computed" if the key exists AND value is positive (>0)
@@ -307,9 +315,6 @@ for dataset_name, (X, y, C0) in datasets.items():
             
             if (k_simu + 1) % 5 == 0:
                 logger.info(f" -> Simulation {k_simu + 1}/{n_simus} completed")
-                avg_bal_acc = np.mean(bal_acc_simulations) 
-                std_bal_acc = np.std(bal_acc_simulations)
-                logger.info(f"     -> Partial Balanced Accuracy: {avg_bal_acc:.5f} ± {std_bal_acc:.5f}")
             
         # Convert list of confusion matrices to a 3D array: (n_simus, n_classes, n_classes)
         CM_array = np.array(CM_simulations)  # Shape: (n_simus, n_classes, n_classes)
@@ -333,18 +338,19 @@ for dataset_name, (X, y, C0) in datasets.items():
             "avg_f1_score": np.mean(f1_simulations), "std_f1_score": np.std(f1_simulations),
         }
 
-        final_metrics = model_metrics.copy()
-        result_data["multiclass_metrics"] = final_metrics
+        result_data["multiclass_metrics"] = model_metrics  
         # Always update runtime (it's new information)
         result_data["execution_time_seconds"] = np.mean(runtime_simulations)        # total time 
         # Normalize by number of dichotomies (makes it comparable across datasets)
-        result_data["execution_time_per_dichotomy"] = result_data["execution_time_seconds"] / num_dichotomies   # normalized (more useful) 
-                
-        logger.info(f"Balanced Accuracy: {final_metrics['avg_bal_acc']:.5f} ± {final_metrics['std_bal_acc']:.5f}")
-        logger.info(f"Geo Mean: {final_metrics['avg_geom_mean']:.5f} ± {final_metrics['std_geom_mean']:.5f}")
+        result_data["execution_time_per_dichotomy"] = result_data["execution_time_seconds"] / num_dichotomies   # normalized (more useful)
+    
+        new_metrics = result_data["multiclass_metrics"] 
+        logger.info(f"Balanced Accuracy: {new_metrics['avg_bal_acc']:.5f} ± {new_metrics['std_bal_acc']:.5f}")
+        logger.info(f"Geo Mean: {new_metrics['avg_geom_mean']:.5f} ± {new_metrics['std_geom_mean']:.5f}")
         logger.info(f"Avg Runtime: {result_data['execution_time_seconds'] :.4f} s")
         logger.info(f"Avg Runtime per dichotomy: {result_data['execution_time_per_dichotomy']:.4f} s")
-      
+
+        
         with open(file_path_o, 'wb') as f:
             pickle.dump(result_data, f)
             
