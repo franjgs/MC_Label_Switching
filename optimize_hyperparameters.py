@@ -39,7 +39,7 @@ from libraries.imbalance_degree import imbalance_degree
 warnings.filterwarnings("ignore", category=ConvergenceWarning)
 
 # Load Configuration
-config = load_config('config_train.yaml')
+config = load_config('config/config_train.yaml')
 
 # -----------------------------------------------------------------------------
 # INITIALIZE LOGGER
@@ -75,8 +75,16 @@ model_selection = config["simulation"]["model_selection"]
 model_list = config["models"]
 
 # COMMENTS FOR SAFE SELECTION:
-# Current YAML models include RandomForestClassifier, LSEnsemble,
-# MLPClassifier, LGBMClassifier, kNN, and SVM.
+# - LogisticRegression: index 0 – Logistic regression with L2 regularization
+# - RandomForestClassifier: index 1 – Random forest with class_weight='balanced'
+# - LSEnsemble: index 2 – Asymmetric Label Switched Ensemble (ALSE) – OUR MAIN METHOD
+# - MLPClassifier: index 3 – Standard multilayer perceptron from scikit-learn
+# - LGBMClassifier: index 4 – LightGBM with is_unbalance=True
+# - kNN: index 5 – K-Nearest Neighbors
+# - C4.5: index 6 – Decision tree with entropy criterion (C4.5 approximation)
+# - SVM: index 7 – Support Vector Machine with RBF kernel
+# - MultiRandBal: index 8 – Ensemble with SMOTE oversampling + random undersampling
+# - LSEnsemble Calibrated: index 9 – ALSE Calibrated 
 
 # Examples of selection (uncomment the desired line):
 
@@ -84,9 +92,10 @@ model_list = config["models"]
 # model_list = config["models"]
 
 # 2. Run only our main method (LSEnsemble / ALSE)
-# model_list = [m for m in config["models"] if m["name"] == "LSEnsemble"] # Only ALSE
+# model_list = [config["models"][2]] # Only ALSE
 
-# 3. Comparison between ALSE and classical baselines (example: RF + SVM + MLP)
+# 3. Comparison between ALSE and classical baselines (example: RF + LightGBM + SVM + MLP)
+# model_list = [config["models"][i] for i in [1, 4, 7, 3]]
 
 # 4. Run only baselines without ALSE (for ablation or clean comparison)
 # model_list = [config["models"][i] for i in [0, 1, 3, 4, 5, 6, 7, 8]]
@@ -94,8 +103,11 @@ model_list = config["models"]
 
 # Apply the desired selection here (uncomment only one option)
 # model_list = config["models"]  # All models
-# model_list = [m for m in config["models"] if m["name"] in {"RandomForestClassifier", "SVM", "MLPClassifier"}]
-model_list = [m for m in config["models"] if m["name"] == "LSEnsemble"] # Only ALSE
+# model_list = [config["models"][i] for i in [1, 7, 3]]
+model_list = [config["models"][2]] # Only ALSE
+# model_list = [config["models"][7], config["models"][3]] 
+# model_list = [config["models"][i] for i in [4, 2, 9]]
+# model_list = [config["models"][9]] # Only ALSE Cal
 
 # Generate Model Configurations
 CV_config = generate_model_configurations(model_list)
@@ -314,8 +326,8 @@ for dataset_name, (X, y, C0) in datasets.items():
                                 alpha_start = estimate_alpha(QP_tr[j_dic])
                                 n_items = len(model_item['dynamic_params'].get('LS_alpha', []))
                                 if n_items > 0:
-                                    model_item['dynamic_params']['LS_alpha'] = np.round(np.linspace(max(0.0, alpha_start - 0.1),
-                                                                                                    min(0.45, alpha_start + 0.2), n_items), 3).tolist() 
+                                    model_item['dynamic_params']['LS_alpha'] = np.round(np.linspace(max(0.0, alpha_start - 0.10),
+                                                                                                    min(0.45, alpha_start + 0.12), n_items), 3).tolist() 
                                 
                         CV_config[model_name] = []  # Reset to avoid accumulating old configs
                         params = model_item['params']

@@ -1,0 +1,156 @@
+logging:
+  level: INFO
+  format: "%(asctime)-15s %(levelname)-8s %(message)s"
+  datefmt: "%Y-%m-%d %H:%M:%S"
+
+simulation:
+  verbose: true
+  force_results: true
+  f_sel: balanced_accuracy_score
+  ecoc_enc:  'sparse' # 'dense' # 'OVA' # 'complete' # 'OVO' # 
+  flg_swp: true
+  maj_min: false
+  min_maj: false
+  n_simus: 10
+  test_size: 25
+  N_MAX: 10000
+  num_folds: 5
+  model_selection: "avg"
+
+paths:
+  data_folder: datasets_highC_sparse # datasets_lowC # datasets_Diamonds
+  output_folder: results_highC_sparse # test_RF_complete # results_Diamonds_dense
+
+models:
+  - name: LogisticRegression
+    class: sklearn.linear_model.LogisticRegression
+    params:
+      solver: lbfgs
+      max_iter: 1000
+    dynamic_params:
+      LR_C: [0.01, 0.1, 1, 10, 100, 1000]
+      LR_penalty: ["l2"]
+
+  - name: RandomForestClassifier
+    class: sklearn.ensemble.RandomForestClassifier
+    params:
+      criterion: gini
+      n_jobs: -1
+      class_weight: balanced
+    dynamic_params:
+      RF_n_estimators: [20, 40, 60]
+      RF_max_depth: [10, 20, null]
+      RF_min_samples_split: [2, 5]
+      RF_min_samples_leaf: [1, 5]
+
+  - name: LSEnsemble
+    class: libraries.labelswitching.LSEnsemble
+    params:
+      base_learner: FAMLP # CalibratedLGBM # LogReg # Parzen # AMLP #CalibratedLGBM # 
+      optim:  lbfgs # Parzen #  adam # 
+      activation_fn: tanh # relu # 
+      loss_fn: MSE
+    dynamic_params:
+      LS_alpha: [0, 0.05, 0.1, 0.15, 0.2]
+      LS_beta: [0, 0.05, 0.1]
+      LS_Q_C: [1, 0.33333, 0.25, 0.2]
+      LS_Q_RB_S: ['auto', 15]  # ['full'] #  [1, 2, 4, 8]
+      LS_Q_RB_C: ['auto', 15] # ['full'] # 
+      LS_num_experts: [11]
+      LS_hidden_size: [4]
+      LS_drop_out: [0.0]
+      LS_n_batch: ["auto"] # [128] # 
+      LS_n_epoch: [1] # [200] # 
+      LS_mode: ["random"] # ["representative"] # 
+    LSE_optimization:
+      SW: true
+      QC: false
+      RI_C: true
+      RI_P: false
+
+  - name: MLPClassifier
+    class: sklearn.neural_network.MLPClassifier
+    params:
+      max_iter: 500
+      random_state: 42
+      tol: 0.0001
+    dynamic_params:
+      MLP_hidden_layer_sizes: [[20], [40], [60]]
+      MLP_activation: ["relu", "tanh", "logistic"]
+      MLP_solver: ["adam"]
+      MLP_alpha: [0.0001, 0.001]
+
+  - name: LGBMClassifier
+    class: lightgbm.LGBMClassifier
+    params:
+      boosting_type: gbdt
+      max_depth: -1
+      force_col_wise: true
+      verbosity: -1
+      is_unbalance: true
+    dynamic_params:
+      LGBM_num_leaves: [31]
+      LGBM_learning_rate: [0.1, 0.05]
+      LGBM_n_estimators: [20, 40, 60]
+
+  - name: kNN
+    class: sklearn.neighbors.KNeighborsClassifier
+    params:
+      algorithm: auto
+      weights: uniform
+    dynamic_params:
+      kNN_n_neighbors: [3, 5, 7, 9]  # Common values for k
+      kNN_metric: [euclidean, manhattan, minkowski]  # Common distance metrics
+
+  - name: C4.5
+    class: sklearn.tree.DecisionTreeClassifier
+    params:
+      criterion: entropy  # C4.5 uses entropy-based splitting
+      splitter: best
+    dynamic_params:
+      C45_max_depth: [null, 5, 10, 20]  # Limits tree depth for regularization
+      C45_min_samples_split: [2, 5, 10]  # Minimum samples needed to split a node
+      C45_min_samples_leaf: [1, 2, 5]  # Minimum samples in a leaf node
+
+  - name: SVM
+    class: sklearn.svm.SVC
+    params:
+      kernel: rbf
+      probability: false # false: will speed up fit() # true : Enables probability estimation
+    dynamic_params:
+      SVM_C: [0.1, 1, 10, 100]  # Regularization parameter
+      SVM_gamma: [scale, 0.1, 1]  # Kernel coefficient
+      
+  - name: MultiRandBal
+    class: libraries.MultiRandBal.MultiRandBal
+    params:
+      oversampler: SMOTE
+      undersampler: RandomUnderSampler
+    dynamic_params:
+      RB_n_estimators: [100]
+      RB_base_estimator: [DecisionTreeClassifier]
+      
+  - name: LSEnsemble_Cal
+    class: libraries.labelswitching.LSEnsemble
+    params:
+      base_learner: CalibratedBooster # FAMLP #  LogReg # Parzen # AMLP #CalibratedLGBM # 
+      optim:  lbfgs # adam # Parzen #  
+      activation_fn: tanh # relu # 
+      loss_fn: MSE
+    dynamic_params:
+      LS_alpha: [0, 0.05, 0.1, 0.15, 0.2] # , 0.25, 0.3, 0.35, 0.4, 0.45]
+      LS_beta: [0, 0.05, 0.1]
+      LS_Q_C: [1, 0.33333, 0.25, 0.2]
+      LS_Q_RB_S: ['auto', 15]  # ['full'] #  [1, 2, 4, 8]
+      LS_Q_RB_C: ['auto', 15] # ['full'] # 
+      LS_num_experts: [11]
+      LS_hidden_size: [4]
+      LS_drop_out: [0.0]
+      LS_n_batch: ["auto"] # [128] # 
+      LS_n_epoch: [1] # [200] #  [200] # 
+      LS_mode: ["random"] # ["representative"] # 
+    LSE_optimization:
+      SW: true
+      QC: false
+      RI_C: false
+      RI_P: false

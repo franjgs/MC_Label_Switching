@@ -115,6 +115,65 @@ def _get_resolver_logger(logger=None):
     return logger if logger is not None else logging.getLogger(__name__)
 
 
+def _normalize_legacy_dynamic_param_names(dynamic_params):
+    """
+    Normalize legacy prefixed dynamic parameter names to constructor-ready names.
+
+    Canonical names are preserved. If a legacy key and its canonical equivalent
+    are both present, the configuration is ambiguous and a ValueError is raised.
+    """
+    legacy_aliases = {
+        "LS_alpha": "alpha",
+        "LS_beta": "beta",
+        "LS_Q_C": "Q_C",
+        "LS_Q_RB_S": "Q_RB_S",
+        "LS_Q_RB_C": "Q_RB_C",
+        "LS_num_experts": "num_experts",
+        "LS_hidden_size": "hidden_size",
+        "LS_drop_out": "drop_out",
+        "LS_n_batch": "n_batch",
+        "LS_n_epoch": "n_epoch",
+        "LS_mode": "mode",
+        "LR_C": "C",
+        "LR_penalty": "penalty",
+        "RF_n_estimators": "n_estimators",
+        "RF_max_depth": "max_depth",
+        "RF_min_samples_split": "min_samples_split",
+        "RF_min_samples_leaf": "min_samples_leaf",
+        "MLP_hidden_layer_sizes": "hidden_layer_sizes",
+        "MLP_activation": "activation",
+        "MLP_solver": "solver",
+        "MLP_alpha": "alpha",
+        "LGBM_num_leaves": "num_leaves",
+        "LGBM_learning_rate": "learning_rate",
+        "LGBM_n_estimators": "n_estimators",
+        "SVM_C": "C",
+        "SVM_gamma": "gamma",
+        "kNN_n_neighbors": "n_neighbors",
+        "kNN_metric": "metric",
+        "C45_max_depth": "max_depth",
+        "C45_min_samples_split": "min_samples_split",
+        "C45_min_samples_leaf": "min_samples_leaf",
+        "RB_n_estimators": "n_estimators",
+        "RB_base_estimator": "base_estimator",
+    }
+
+    normalized = {}
+
+    for key, value in dynamic_params.items():
+        normalized_key = legacy_aliases.get(key, key)
+
+        if normalized_key in normalized:
+            raise ValueError(
+                f"Ambiguous dynamic parameter configuration: '{key}' maps to "
+                f"'{normalized_key}', which is already defined."
+            )
+
+        normalized[normalized_key] = value
+
+    return normalized
+
+
 def _expand_lse_rebalance_values(values, param_name, qp_tr):
     """
     Expand LSE rebalance YAML specifications into explicit numeric search values.
@@ -484,26 +543,11 @@ def _resolve_lse_model_configurations(model_item, x_train=None, y_train_lab=None
     item = copy.deepcopy(model_item)
 
     params = dict(item.get("params", {}))
-    dynamic_params = dict(item.get("dynamic_params", {}))
+    dynamic_params = _normalize_legacy_dynamic_param_names(
+        dict(item.get("dynamic_params", {}))
+    )
     lse_optimization = dict(item.get("LSE_optimization", {}))
     base_learner_params = dict(item.get("base_learner_params", {}))
-
-    lse_dynamic_aliases = {
-        "LS_alpha": "alpha",
-        "LS_beta": "beta",
-        "LS_Q_C": "Q_C",
-        "LS_Q_RB_S": "Q_RB_S",
-        "LS_Q_RB_C": "Q_RB_C",
-        "LS_num_experts": "num_experts",
-        "LS_hidden_size": "hidden_size",
-        "LS_drop_out": "drop_out",
-        "LS_n_batch": "n_batch",
-        "LS_n_epoch": "n_epoch",
-        "LS_mode": "mode",
-    }
-    for alias, canonical in lse_dynamic_aliases.items():
-        if alias in dynamic_params and canonical not in dynamic_params:
-            dynamic_params[canonical] = dynamic_params.pop(alias)
 
     base_learner = params.get("base_learner", "FAMLP")
     optim = params.get("optim", None)
@@ -809,7 +853,9 @@ def _resolve_standard_model_configurations(model_item):
 
     model_name = item["name"]
     fixed_params = dict(item.get("params", {}))
-    dynamic_params = dict(item.get("dynamic_params", {}))
+    dynamic_params = _normalize_legacy_dynamic_param_names(
+        dict(item.get("dynamic_params", {}))
+    )
 
     if not dynamic_params:
         return [
@@ -828,40 +874,10 @@ def _resolve_standard_model_configurations(model_item):
     for combination in product(*values):
         param_dict = dict(zip(keys, combination))
 
-        # Start from all fixed parameters and add all dynamic parameters
-        # exactly as they are declared in YAML.
+        # Start from all fixed parameters and add all normalized dynamic
+        # parameters exactly as constructors expect them.
         updated_config = dict(fixed_params)
         updated_config.update(param_dict)
-
-        # --------------------------------------------------------------
-        # Compatibility blocks for prefixed YAML names used in current and
-        # historical experiment files.
-        # --------------------------------------------------------------
-        param_aliases = {
-            "RF_n_estimators": "n_estimators",
-            "RF_max_depth": "max_depth",
-            "RF_min_samples_split": "min_samples_split",
-            "RF_min_samples_leaf": "min_samples_leaf",
-            "MLP_hidden_layer_sizes": "hidden_layer_sizes",
-            "MLP_activation": "activation",
-            "MLP_solver": "solver",
-            "MLP_alpha": "alpha",
-            "LGBM_num_leaves": "num_leaves",
-            "LGBM_learning_rate": "learning_rate",
-            "LGBM_n_estimators": "n_estimators",
-            "kNN_n_neighbors": "n_neighbors",
-            "kNN_metric": "metric",
-            "C45_max_depth": "max_depth",
-            "C45_min_samples_split": "min_samples_split",
-            "C45_min_samples_leaf": "min_samples_leaf",
-            "SVM_C": "C",
-            "SVM_gamma": "gamma",
-            "RB_n_estimators": "n_estimators",
-            "RB_base_estimator": "base_estimator",
-        }
-        for alias, canonical in param_aliases.items():
-            if alias in updated_config:
-                updated_config[canonical] = updated_config.pop(alias)
 
         updated_config = {
             key: value
@@ -1221,7 +1237,7 @@ def generate_batches(nBatch, param, mode='random', seed=42):
         yield list_samples_batch[kbatch]
 
 
-def estimate_alpha(ir: float, cap: bool = True) -> float:
+def estimate_alpha(ir, cap=True):
     """
     Estimates a reasonable starting value for Alpha based on Imbalance Ratio (IR).
     
