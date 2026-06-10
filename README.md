@@ -20,19 +20,19 @@ For further details on likelihood ratio estimation and Bayes threshold transform
     * It systematically explores different configurations of model parameters.
     * It evaluates the performance of each configuration using cross-validation or a similar technique.
     * The script saves the best-performing model configurations (parameters) for later use in the evaluation phase.
-    * It is driven by the configurations specified in the `config/config.yaml` file, including the models to optimize and the ranges of their hyperparameters.
+    * It is driven by the selected YAML file under `config/`, including the models to optimize and the ranges of their hyperparameters.
 * **Binarization Decomposition:**
     * Implements binarization matrices for effective multiclass to binary transformation.
-    * Offers flexible One-versus-One (OvO), OvR, and ECOC encoding options (complete, dense, sparse) configurable via `config/config.yaml`.
+    * Offers flexible One-versus-One (OvO), OvR, and ECOC encoding options (complete, dense, sparse) configurable through the selected YAML file.
 * **ALS Ensemble Algorithm:**
     * A specialized ensemble algorithm designed for label switching correction, enhancing model robustness.
-    * Provides configurable optimization parameters for the ALS Ensemble via `config/config.yaml`.
+    * Provides configurable optimization parameters for the ALS Ensemble through the selected YAML file.
 * **Comprehensive Evaluation:**
     * Includes a thorough evaluation suite using key multiclass metrics: balanced accuracy, Cohen's kappa, geometric mean, and sensitivity.
     * Features detailed logging and output to facilitate performance analysis.
 * **Configuration-Driven Design:**
-    * Leverages `config/config.yaml` for easy customization of datasets, models, and evaluation settings.
-    * Employs streamlined model selection logic based on peak or average performance, configurable through `config/config.yaml`.
+    * Leverages YAML files under `config/` for easy customization of datasets, models, and evaluation settings.
+    * Employs streamlined model selection logic based on peak or average performance, configurable through the selected YAML file.
 * **Model Persistence:**
     * Saves models configured with optimized hyperparameters, along with their configurations, using pickle for efficient testing and deployment.
     * Utilizes a naming convention for saved models that includes the parameters used for the ALS Ensemble.
@@ -41,7 +41,7 @@ For further details on likelihood ratio estimation and Bayes threshold transform
     * It loads the best model configurations (parameters) saved during the optimization phase by `optimize_hyperparameters.py`.
     * Subsequently, it instantiates and trains the models using these optimal configurations.
     * The script concludes by performing testing on a separate dataset to obtain the final performance metrics.
-    * It relies on the `config/config.yaml` file to load necessary parameters and instantiate the model architecture based on the stored configurations.
+    * It relies on the selected YAML file to load datasets, output paths, model definitions, and evaluation settings.
 * **Dataset Flexibility:**
     * Engineered to accommodate a wide range of datasets stored within a designated data folder.
 
@@ -54,25 +54,46 @@ For further details on likelihood ratio estimation and Bayes threshold transform
     cd MC_Label_Switching
     ```
 
-2.  **Configure `config/config.yaml`:**
+2.  **Choose a configuration file:**
 
-    * Open the `config/config.yaml` file and adjust settings for datasets, models, optimization parameters, evaluation metrics, and other project configurations as needed.
+    * Use `config/config_train.yaml` for optimization runs.
+    * Use `config/config_test.yaml` for final evaluation runs.
+    * Use `config/config_smoke.yaml` for the minimal validated workflow.
 
 3.  **Run the hyperparameter optimization script:**
 
     ```bash
-    python optimize_hyperparameters.py
+    python optimize_hyperparameters.py --config config/config_train.yaml
     ```
 
-    * This script will explore different hyperparameter combinations and save the best configurations in `output_folder`.
+    * This script explores binary hyperparameter configurations per dichotomy and saves the best configurations as `*_train.pkl` files in `paths.output_folder`.
 
 4.  **Run the performance evaluation script:**
 
     ```bash
-    python evaluate_performance.py
+    python evaluate_performance.py --config config/config_test.yaml
     ```
 
-    * This script will load the saved optimal hyperparameters, train the models with these configurations, and evaluate their performance on the test datasets. The results will be saved in `output_folder`.
+    * This script loads the saved `*_train.pkl` files, retrains the models with the best binary configurations, computes final multiclass performance, and saves `*_test.pkl` files in `paths.output_folder`.
+
+## Configuration Files
+
+* `config/config_train.yaml`: default configuration for `optimize_hyperparameters.py`.
+* `config/config_test.yaml`: default configuration for `evaluate_performance.py`.
+* `config/config_smoke.yaml`: minimal validated configuration for quick end-to-end checks.
+
+Model grids can use either the legacy flat MC schema with prefixed dynamic parameters (`LS_`, `LR_`, `RF_`, `MLP_`, `LGBM_`, `SVM_`, `kNN_`, `C45_`, `RB_`) or the structured shared LSEnsemble configuration format. The structured format is recommended for new LSEnsemble configurations and uses `params.base_learner`, `params.base_learner_configs`, and canonical dynamic parameters such as `alpha`, `beta`, `Q_C`, `Q_RB_S`, `Q_RB_C`, and `num_experts`.
+
+## Smoke Test
+
+The minimal validated workflow is:
+
+```bash
+python optimize_hyperparameters.py --config config/config_smoke.yaml
+python evaluate_performance.py --config config/config_smoke.yaml
+```
+
+The first command writes `*_train.pkl` files to the configured output folder. The second command reads those files, performs the final multiclass evaluation, and writes `*_test.pkl` files.
 
 ## Dependencies
 
@@ -89,11 +110,12 @@ For further details on likelihood ratio estimation and Bayes threshold transform
 
 ## Datasets
 
-* Place your datasets in the `datasets` folder (or specify the path in `config/config.yaml`).
+* Place versioned datasets in the `datasets` folder, or point `paths.data_folder` to a local dataset folder in the selected YAML file.
 
 ## Output
 
-* Trained models and evaluation metrics are saved in the `results` folder.
+* Trained configurations and evaluation metrics are saved in the configured `paths.output_folder`.
+* Do not version generated outputs or local datasets such as `results/`, `results*/`, `results_smoke/`, `datasets_lowC_complete/`, `*.pkl`, `*.joblib`, `*.npy`, `*.npz`, `*.csv`, or log files.
 
 ## Contributing
 
