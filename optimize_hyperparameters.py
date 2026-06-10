@@ -1,8 +1,8 @@
 import os
 import pickle
 
+import argparse
 import warnings
-from itertools import product
 
 import numpy as np
 import pandas as pd
@@ -32,14 +32,24 @@ from libraries.data_loading import load_datasets
 from libraries.functions import load_config, setup_logger, get_class_from_string
 from libraries.functions import generate_model_configurations, apply_ecoc_binarization
 
-from libraries.functions import compute_imbalance_ratio, estimate_alpha
+from libraries.functions import compute_imbalance_ratio
 from libraries.imbalance_degree import imbalance_degree
 
 # Suppress ConvergenceWarnings
 warnings.filterwarnings("ignore", category=ConvergenceWarning)
 
+parser = argparse.ArgumentParser(
+    description="Optimize hyperparameters for binary-decomposition multiclass experiments."
+)
+parser.add_argument(
+    "--config",
+    default="config/config_train.yaml",
+    help="Path to the YAML configuration file."
+)
+args = parser.parse_args()
+
 # Load Configuration
-config = load_config('config/config_train.yaml')
+config = load_config(args.config)
 
 # -----------------------------------------------------------------------------
 # INITIALIZE LOGGER
@@ -75,16 +85,7 @@ model_selection = config["simulation"]["model_selection"]
 model_list = config["models"]
 
 # COMMENTS FOR SAFE SELECTION:
-# - LogisticRegression: index 0 – Logistic regression with L2 regularization
-# - RandomForestClassifier: index 1 – Random forest with class_weight='balanced'
-# - LSEnsemble: index 2 – Asymmetric Label Switched Ensemble (ALSE) – OUR MAIN METHOD
-# - MLPClassifier: index 3 – Standard multilayer perceptron from scikit-learn
-# - LGBMClassifier: index 4 – LightGBM with is_unbalance=True
-# - kNN: index 5 – K-Nearest Neighbors
-# - C4.5: index 6 – Decision tree with entropy criterion (C4.5 approximation)
-# - SVM: index 7 – Support Vector Machine with RBF kernel
-# - MultiRandBal: index 8 – Ensemble with SMOTE oversampling + random undersampling
-# - LSEnsemble Calibrated: index 9 – ALSE Calibrated 
+# Select models by name so the script does not depend on YAML ordering.
 
 # Examples of selection (uncomment the desired line):
 
@@ -92,22 +93,17 @@ model_list = config["models"]
 # model_list = config["models"]
 
 # 2. Run only our main method (LSEnsemble / ALSE)
-# model_list = [config["models"][2]] # Only ALSE
+# model_list = [m for m in config["models"] if m["name"] == "LSEnsemble"]
 
 # 3. Comparison between ALSE and classical baselines (example: RF + LightGBM + SVM + MLP)
-# model_list = [config["models"][i] for i in [1, 4, 7, 3]]
+# model_list = [m for m in config["models"] if m["name"] in {"RandomForestClassifier", "LGBMClassifier", "SVM", "MLPClassifier"}]
 
 # 4. Run only baselines without ALSE (for ablation or clean comparison)
-# model_list = [config["models"][i] for i in [0, 1, 3, 4, 5, 6, 7, 8]]
-# del model_list[2]  # Example of exclusion if using the full list
+# model_list = [m for m in config["models"] if "LSEnsemble" not in m["name"]]
 
 # Apply the desired selection here (uncomment only one option)
 # model_list = config["models"]  # All models
-# model_list = [config["models"][i] for i in [1, 7, 3]]
-model_list = [config["models"][2]] # Only ALSE
-# model_list = [config["models"][7], config["models"][3]] 
-# model_list = [config["models"][i] for i in [4, 2, 9]]
-# model_list = [config["models"][9]] # Only ALSE Cal
+model_list = [m for m in config["models"] if m["name"] == "LSEnsemble"]
 
 # Generate Model Configurations
 CV_config = generate_model_configurations(model_list)
@@ -199,8 +195,7 @@ for dataset_name, (X, y, C0) in datasets.items():
                 partial_filename_o[model_name] = f"{dataset_name}_{ECOC_enc}_{model_name}_partial_train.pkl"
             filename_o[model_name] = f"{dataset_name}_{ECOC_enc}_{model_name}_train.pkl"
 
-        dynamic_combinations = model_item["dynamic_params"]
-        n_conf_test = len(list(product(*model_item["dynamic_params"].values())))
+        n_conf_test = len(CV_config[model_name])
 
         CV_config_full[model_name] = [[] for j_dic in range(num_dichotomies)]
         CM_accumulated[model_name] = [np.zeros((n_conf_test, 2, 2)) for j_dic in range(num_dichotomies)]  # Accumulated confusion matrix
@@ -302,59 +297,12 @@ for dataset_name, (X, y, C0) in datasets.items():
                     model_name = model_item["name"]
                     model_class = get_class_from_string(model_item["class"])
                     if 'LSEnsemble' in model_name:
-                        if model_item['LSE_optimization']['RI_C']:
-                            # Cost: auto
-                            if model_item['params']['Q_RB_C_mode'] == "auto":
-                                n_items = len(model_item['dynamic_params'].get('LS_Q_RB_C', []))
-                                if n_items > 0:
-                                    model_item['dynamic_params']['LS_Q_RB_C'] = np.linspace(1, QP_tr[j_dic], n_items).tolist()
-                            elif model_item['params']['Q_RB_C_mode'] == "full": # Full Rebalance
-                                model_item['dynamic_params']['LS_Q_RB_C'] = [QP_tr[j_dic]]
-                                
-                        if model_item['LSE_optimization']['RI_P']:
-                            # Population: auto
-                            if model_item['params']['Q_RB_S_mode'] == "auto":
-                                n_items = len(model_item['dynamic_params'].get('LS_Q_RB_S', []))
-                                if n_items > 0:
-                                    model_item['dynamic_params']['LS_Q_RB_S'] = np.linspace(1, QP_tr[j_dic], n_items).tolist()
-                            elif model_item['params']['Q_RB_S_mode'] == "full": # Full Rebalance
-                                model_item['dynamic_params']['LS_Q_RB_S'] = [QP_tr[j_dic]]
-                        
-                        if model_item['LSE_optimization']['SW']:
-                            # Cost: auto
-                            if model_item['params']['SW_mode'] == "auto":
-                                alpha_start = estimate_alpha(QP_tr[j_dic])
-                                n_items = len(model_item['dynamic_params'].get('LS_alpha', []))
-                                if n_items > 0:
-                                    model_item['dynamic_params']['LS_alpha'] = np.round(np.linspace(max(0.0, alpha_start - 0.10),
-                                                                                                    min(0.45, alpha_start + 0.12), n_items), 3).tolist() 
-                                
-                        CV_config[model_name] = []  # Reset to avoid accumulating old configs
-                        params = model_item['params']
-                        dynamic_params = model_item['dynamic_params']
-                        # Create parameter grid
-                        param_grid = {
-                            "base_learner": [params['base_learner']],
-                            "optim": [params['optim']],
-                            "activation_fn": [params['activation_fn']],
-                            "loss_fn": [params['loss_fn']],
-                            "alpha": dynamic_params['LS_alpha'],
-                            "beta": dynamic_params['LS_beta'],
-                            "QC": dynamic_params['LS_Q_C'],
-                            "Q_RB_S": dynamic_params['LS_Q_RB_S'],
-                            "Q_RB_C": dynamic_params['LS_Q_RB_C'],
-                            "num_experts": dynamic_params['LS_num_experts'],
-                            "hidden_size": dynamic_params['LS_hidden_size'],
-                            "drop_out": dynamic_params['LS_drop_out'],
-                            "n_batch": dynamic_params['LS_n_batch'],
-                            "n_epoch": dynamic_params['LS_n_epoch'],
-                            "mode": dynamic_params['LS_mode'],
-                            "input_size": [input_size],
-                        }
-            
-                        # Generate all parameter combinations
-                        for combination in product(*param_grid.values()):
-                            CV_config[model_name].append(dict(zip(param_grid.keys(), combination)))
+                        CV_config[model_name] = generate_model_configurations(
+                            [model_item],
+                            x_train=x_train,
+                            y_train_lab=ye_train,
+                            logger=logger
+                        )[model_name]
                         
                     CV_config_full[model_name][j_dic] = CV_config[model_name]
                 

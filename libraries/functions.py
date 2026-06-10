@@ -814,7 +814,7 @@ def _resolve_lse_model_configurations(model_item, x_train=None, y_train_lab=None
 
     logger.debug(
         "Resolved %d LSE configurations for model '%s' with base_learner='%s' "
-        "(structured_base_configs=%s, SW_mode=%s, Q_RB_C_mode=%s, "
+        "(structured_base_configs=%s, switching_mode=%s, Q_RB_C_mode=%s, "
         "Q_RB_S_mode=%s, qp_tr=%.4f).",
         len(resolved_configs),
         item.get("name", "unknown"),
