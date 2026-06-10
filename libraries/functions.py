@@ -61,7 +61,7 @@ def get_class_from_string(class_path):
     module = importlib.import_module(module_path)
     return getattr(module, class_name)
 
-def load_config(filepath="config.yaml"):
+def load_config(filepath="config/config.yaml"):
     with open(filepath, "r") as f:
         config = yaml.safe_load(f)
     return config
