@@ -8,6 +8,7 @@ Created on Thu Mar  6 18:51:23 2025
 import numpy as np
 import yaml
 import logging
+import os
 from itertools import product
 import copy
 import importlib
@@ -62,6 +63,19 @@ def get_class_from_string(class_path):
     return getattr(module, class_name)
 
 def load_config(filepath="config/config.yaml"):
+    """
+    Load a YAML configuration file.
+
+    Legacy script names such as config_train.yaml and config_test.yaml are
+    resolved to config/config.yaml when no file exists at the requested path.
+    """
+    if not os.path.exists(filepath) and os.path.basename(filepath) in {
+        "config.yaml",
+        "config_train.yaml",
+        "config_test.yaml",
+    }:
+        filepath = os.path.join("config", "config.yaml")
+
     with open(filepath, "r") as f:
         config = yaml.safe_load(f)
     return config
@@ -474,6 +488,23 @@ def _resolve_lse_model_configurations(model_item, x_train=None, y_train_lab=None
     lse_optimization = dict(item.get("LSE_optimization", {}))
     base_learner_params = dict(item.get("base_learner_params", {}))
 
+    lse_dynamic_aliases = {
+        "LS_alpha": "alpha",
+        "LS_beta": "beta",
+        "LS_Q_C": "Q_C",
+        "LS_Q_RB_S": "Q_RB_S",
+        "LS_Q_RB_C": "Q_RB_C",
+        "LS_num_experts": "num_experts",
+        "LS_hidden_size": "hidden_size",
+        "LS_drop_out": "drop_out",
+        "LS_n_batch": "n_batch",
+        "LS_n_epoch": "n_epoch",
+        "LS_mode": "mode",
+    }
+    for alias, canonical in lse_dynamic_aliases.items():
+        if alias in dynamic_params and canonical not in dynamic_params:
+            dynamic_params[canonical] = dynamic_params.pop(alias)
+
     base_learner = params.get("base_learner", "FAMLP")
     optim = params.get("optim", None)
 
@@ -803,34 +834,34 @@ def _resolve_standard_model_configurations(model_item):
         updated_config.update(param_dict)
 
         # --------------------------------------------------------------
-        # Legacy compatibility blocks for older experiment names only.
-        # These do not affect the current YAML models.
+        # Compatibility blocks for prefixed YAML names used in current and
+        # historical experiment files.
         # --------------------------------------------------------------
-        if model_name == "kNN":
-            if "kNN_n_neighbors" in param_dict:
-                updated_config["n_neighbors"] = param_dict["kNN_n_neighbors"]
-            if "kNN_metric" in param_dict:
-                updated_config["metric"] = param_dict["kNN_metric"]
-
-        elif model_name == "C4.5":
-            if "C45_max_depth" in param_dict:
-                updated_config["max_depth"] = param_dict["C45_max_depth"]
-            if "C45_min_samples_split" in param_dict:
-                updated_config["min_samples_split"] = param_dict["C45_min_samples_split"]
-            if "C45_min_samples_leaf" in param_dict:
-                updated_config["min_samples_leaf"] = param_dict["C45_min_samples_leaf"]
-
-        elif model_name == "SVM":
-            if "SVM_C" in param_dict:
-                updated_config["C"] = param_dict["SVM_C"]
-            if "SVM_gamma" in param_dict:
-                updated_config["gamma"] = param_dict["SVM_gamma"]
-
-        elif model_name == "MultiRandBal":
-            if "RB_n_estimators" in param_dict:
-                updated_config["n_estimators"] = param_dict["RB_n_estimators"]
-            if "RB_base_estimator" in param_dict:
-                updated_config["base_estimator"] = param_dict["RB_base_estimator"]
+        param_aliases = {
+            "RF_n_estimators": "n_estimators",
+            "RF_max_depth": "max_depth",
+            "RF_min_samples_split": "min_samples_split",
+            "RF_min_samples_leaf": "min_samples_leaf",
+            "MLP_hidden_layer_sizes": "hidden_layer_sizes",
+            "MLP_activation": "activation",
+            "MLP_solver": "solver",
+            "MLP_alpha": "alpha",
+            "LGBM_num_leaves": "num_leaves",
+            "LGBM_learning_rate": "learning_rate",
+            "LGBM_n_estimators": "n_estimators",
+            "kNN_n_neighbors": "n_neighbors",
+            "kNN_metric": "metric",
+            "C45_max_depth": "max_depth",
+            "C45_min_samples_split": "min_samples_split",
+            "C45_min_samples_leaf": "min_samples_leaf",
+            "SVM_C": "C",
+            "SVM_gamma": "gamma",
+            "RB_n_estimators": "n_estimators",
+            "RB_base_estimator": "base_estimator",
+        }
+        for alias, canonical in param_aliases.items():
+            if alias in updated_config:
+                updated_config[canonical] = updated_config.pop(alias)
 
         updated_config = {
             key: value

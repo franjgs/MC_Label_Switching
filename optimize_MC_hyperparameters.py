@@ -62,7 +62,7 @@ METRIC_FUNCTIONS = {
     "matthews_corrcoef": matthews_corrcoef,
 }
 
-# Load configurations
+# Load configurations. Legacy names resolve to config/config.yaml.
 config_train = load_config('config_train.yaml')
 config_test = load_config('config_test.yaml')
 
@@ -97,9 +97,12 @@ model_selection = config_train["simulation"]["model_selection"]
 model_list = config_train["models"]
 # Apply the desired selection (uncomment as needed)
 # model_list = config["models"]  # All models
-# model_list = [config["models"][i] for i in [1, 4, 7, 3]]  # RF, LGBM, SVM, MLP
-# model_list = [config["models"][2]]  # Only ALSE (skip, not native multiclass)
-model_list = [config_train["models"][i] for i in [0, 1, 3, 4, 5, 6, 7]]  # Exclude LSEnsemble & MultiRandBal
+# model_list = [m for m in config_train["models"] if m["name"] in {"RandomForestClassifier", "LGBMClassifier", "SVM", "MLPClassifier"}]
+# model_list = [m for m in config_train["models"] if m["name"] == "LSEnsemble"]  # Skip, not native multiclass
+model_list = [
+    m for m in config_train["models"]
+    if m["name"] not in {"LSEnsemble", "MultiRandBal"}
+]
 # Generate Model Configurations (your function)
 CV_config = generate_model_configurations(model_list)
 

@@ -61,15 +61,8 @@ output_path = config["paths"]["output_folder"]
 model_list = config["models"]
 
 # COMMENTS FOR SAFE SELECTION:
-# - LogisticRegression: index 0 – Logistic regression with L2 regularization
-# - RandomForestClassifier: index 1 – Random forest with class_weight='balanced'
-# - LSEnsemble: index 2 – Asymmetric Label Switched Ensemble (ALSE) – OUR MAIN METHOD
-# - MLPClassifier: index 3 – Standard multilayer perceptron from scikit-learn
-# - LGBMClassifier: index 4 – LightGBM with is_unbalance=True
-# - kNN: index 5 – K-Nearest Neighbors
-# - C4.5: index 6 – Decision tree with entropy criterion (C4.5 approximation)
-# - SVM: index 7 – Support Vector Machine with RBF kernel
-# - MultiRandBal: index 8 – Ensemble with SMOTE oversampling + random undersampling
+# Current YAML models include RandomForestClassifier, LSEnsemble,
+# MLPClassifier, LGBMClassifier, kNN, and SVM.
 
 # Examples of selection (uncomment the desired line):
 
@@ -77,10 +70,9 @@ model_list = config["models"]
 # model_list = config["models"]
 
 # 2. Run only our main method (LSEnsemble / ALSE)
-# model_list = [config["models"][2]] # Only ALSE
+# model_list = [m for m in config["models"] if m["name"] == "LSEnsemble"] # Only ALSE
 
 # 3. Comparison between ALSE and classical baselines (example: RF + LightGBM + SVM + MLP)
-# model_list = [config["models"][i] for i in [1, 4, 7, 3]]
 
 # 4. Run only baselines without ALSE (for ablation or clean comparison)
 # model_list = [config["models"][i] for i in [0, 1, 3, 4, 5, 6, 7, 8]]
@@ -88,8 +80,8 @@ model_list = config["models"]
 
 # Apply the desired selection here (uncomment only one option)
 # model_list = config["models"]  # All models
-# model_list = [config["models"][i] for i in [1, 4, 7, 3]]
-model_list = [config["models"][2]] # Only ALSE
+# model_list = [m for m in config["models"] if m["name"] in {"RandomForestClassifier", "LGBMClassifier", "SVM", "MLPClassifier"}]
+model_list = [m for m in config["models"] if m["name"] == "LSEnsemble"] # Only ALSE
 
 
 # Load Datasets
