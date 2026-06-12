@@ -27,3 +27,6 @@ libraries/cached_matrices/
 datasets/generated/
 datasets/generated*/
 datasets_lowC_complete/
+
+# Local experiment configs
+local_configs/
