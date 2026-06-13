@@ -83,7 +83,30 @@ models:
       
       # Cost and rebalancing factors.
       #
-      # Q_C    : Bayes decision cost ratio QC = (C10 - C00) / (C01 - C11).
+      # Q_C is the multiplicative correction applied to the nominal
+      # Bayes decision cost ratio derived from class_cost:
+      #
+      #   QC_bayes = (C10 - C00) / (C01 - C11)
+      #
+      # with:
+      #   C10 = negative_class_cost  # false positive cost
+      #   C00 = 0.0                  # true negative cost
+      #   C01 = positive_class_cost  # false negative cost
+      #   C11 = 0.0                  # true positive cost
+      #
+      # The effective cost ratio used in the final LSEnsemble threshold is:
+      #
+      #   QC_eff = Q_C * QC_bayes
+      #
+      # Therefore, Q_C is a correction / operating-point multiplier, not
+      # necessarily the final Bayes cost ratio itself. They coincide only
+      # when class_cost = [1, 1].
+      #
+      # Examples:
+      #   class_cost=[1,1], Q_C=1.075 -> QC_eff=1.075
+      #   class_cost=[1,3], Q_C=1.075 -> QC_eff=1.075/3=0.3583
+      #   class_cost=[2,1], Q_C=1.075 -> QC_eff=2.150
+      #
       # Q_RB_S : neutral / population rebalancing factor.
       # Q_RB_C : classification-oriented rebalancing factor.
       Q_C: [1]
