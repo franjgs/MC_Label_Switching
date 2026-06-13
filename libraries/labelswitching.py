@@ -218,20 +218,35 @@ class LSEnsemble(nn.Module):
             Switching factor from minority to majority class.
 
         QC : float or None, optional
-            Bayes decision cost ratio used in the final decision threshold.
-
-            If provided, this value is used directly.
-
-            If None, it is derived from class_cost as:
-
-                QC = (C10 - C00) / (C01 - C11)
-
+            Multiplicative correction applied to the nominal Bayes decision
+            cost ratio.
+        
+            The nominal Bayes cost ratio is derived from class_cost as:
+        
+                QC_bayes = (C10 - C00) / (C01 - C11)
+        
             with:
             - C10 = negative_class_cost  (false positive cost)
             - C00 = 0.0                  (true negative cost)
             - C01 = positive_class_cost  (false negative cost)
             - C11 = 0.0                  (true positive cost)
-
+        
+            If QC is None, no additional correction is applied:
+        
+                QC_multiplier = 1.0
+                QC_effective = QC_bayes
+        
+            If QC is provided, it is interpreted as a positive multiplicative
+            correction factor:
+        
+                QC_multiplier = QC
+                QC_effective = QC_multiplier * QC_bayes
+        
+            The value used in the final decision threshold is QC_effective,
+            stored internally as self.QC. Therefore, the input parameter QC
+            should not be interpreted as the final Bayes cost ratio unless
+            class_cost = [1.0, 1.0].
+            
         Q_RB_C : float, optional
             Classification-oriented rebalancing cost factor.
 
